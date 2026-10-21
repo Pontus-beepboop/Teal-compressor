@@ -10,6 +10,8 @@ There is a desktop app (macOS, Windows, Linux) with drag and drop and a before/a
 quality previewer. There is also a headless command line tool and a C API for scripts
 and build servers.
 
+![Blue Compressor desktop app](docs/screenshot.png)
+
 > **Status: early and experimental.** It has been tested on one Z8 clip and one ZR clip,
 > on macOS (Apple silicon). Keep your originals until you have checked the outputs in
 > your own pipeline.
