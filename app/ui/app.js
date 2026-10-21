@@ -1,0 +1,1269 @@
+// Blue Compressor UI. The queue lives here; the Rust side scans, probes, previews and runs jobs.
+"use strict";
+
+const T = window.__TAURI__;
+const $ = (id) => document.getElementById(id);
+
+// Outside Tauri (a plain browser), a small stand-in keeps the page usable for design work.
+const api = T ? {
+  invoke: (cmd, args) => T.core.invoke(cmd, args),
+  listen: (ev, fn) => T.event.listen(ev, (e) => fn(e.payload)),
+  onDragDrop: (fn) => T.webview.getCurrentWebview().onDragDropEvent((e) => fn(e.payload)),
+} : browserStandIn();
+
+const QUALITY = {
+  1: { title: "Lossless", saving: "4 to 10% smaller", keep: 0.93,
+       text: "The camera's coded data is repacked without its padding. Every pixel is identical to the original." },
+  2: { title: "Archival", saving: "18 to 27% smaller", keep: 0.78,
+       text: "Requantized just past the camera's own setting. The error stays below sensor noise." },
+  3: { title: "High", saving: "39 to 43% smaller", keep: 0.59,
+       text: "One step further. Shadow noise is smoothed slightly; detail and highlights are untouched." },
+  4: { title: "Compact", saving: "58 to 62% smaller", keep: 0.4,
+       text: "For offline and reference copies. Visible smoothing in deep shadows." },
+};
+const RESOLUTION_NOTES = {
+  original: "Keeps the recorded raw resolution. Only the coded data changes.",
+  "6k": "6048 × 3402 active. Clips already 6K or smaller keep their size.",
+  "4k": "3840 × 2160 active (UHD). Raw is area-scaled per CFA colour, then re-encoded.",
+};
+const RES_LABEL = { original: "Original", "6k": "6K", "4k": "4K UHD" };
+const BETA_ACK = "beta-ack-1";
+
+// Short name of a setting, as the output folders are named: "Q2", "Q3 4K".
+const variantName = (q, r) => `Q${q}${r === "6k" ? " 6K" : r === "4k" ? " 4K" : ""}`;
+// Whether a job's resolution setting actually changes its size.
+const resizes = (j, r) => r !== "original" && !(r === "6k" && j.width <= 6060) && !(r === "4k" && j.width <= 3852);
+const settingLabel = (q, r) => `Q${q} ${QUALITY[q].title}${r !== "original" ? " · " + RES_LABEL[r] : ""}`;
+
+const settings = Object.assign(
+  { resolution: "original", quality: 2, backend: "gpu", outputFolder: null, dest: "next", sameForAll: true },
+  readSettings(),
+);
+let jobs = [];
+let nextId = 1;
+let running = false;
+let info = { gpu: "", cpu: "", platform: "" };
+const els = new Map(); // job id -> card element
+
+function readSettings() {
+  try { return JSON.parse(localStorage.getItem("settings") || "{}"); } catch { return {}; }
+}
+function saveSettings() {
+  try { localStorage.setItem("settings", JSON.stringify(settings)); } catch { /* private mode */ }
+}
+
+// Effective settings of a job: its own when settings are per clip, else the global ones.
+const qualityOf = (j) => (settings.sameForAll ? settings.quality : j.quality);
+const resolutionOf = (j) => (settings.sameForAll ? settings.resolution : j.resolution);
+
+// Formatting -----------------------------------------------------------------
+
+function gb(bytes) {
+  if (bytes >= 1e12) return (bytes / 1e12).toFixed(2) + " TB";
+  if (bytes >= 1e9) return (bytes / 1e9).toFixed(2) + " GB";
+  if (bytes >= 1e6) return (bytes / 1e6).toFixed(bytes >= 1e8 ? 0 : 1) + " MB";
+  return (bytes / 1e3).toFixed(0) + " KB";
+}
+function clock(s) {
+  if (!isFinite(s) || s < 0) return "";
+  s = Math.round(s);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  return h ? `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}` : `${m}:${String(sec).padStart(2, "0")}`;
+}
+function timecode(frame, fps) {
+  const f = Math.max(1, Math.round(fps || 25));
+  const total = Math.floor(frame / f);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${pad(Math.floor(total / 3600))}:${pad(Math.floor(total / 60) % 60)}:${pad(total % 60)}:${pad(frame % f)}`;
+}
+const duration = (s) => (s < 60 ? `${s.toFixed(1)} s` : clock(s));
+const fpsText = (f) => (f >= 100 ? f.toFixed(0) : f.toFixed(1));
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+
+// Settings panel ---------------------------------------------------------------
+
+function bindSeg(id, key, parse = (v) => v) {
+  $(id).addEventListener("click", async (e) => {
+    const b = e.target.closest("button");
+    if (!b || running) return;
+    settings[key] = parse(b.dataset.value);
+    saveSettings();
+    if (key === "resolution") await planTargets();
+    renderAll();
+  });
+}
+
+function setSeg(id, value, disabled = false) {
+  for (const b of $(id).querySelectorAll("button")) {
+    const on = String(value) === b.dataset.value;
+    b.classList.toggle("active", on);
+    b.setAttribute("aria-checked", on);
+    if (disabled !== null) b.disabled = disabled;
+  }
+}
+
+function renderSettings() {
+  setSeg("seg-resolution", settings.resolution, running);
+  setSeg("seg-quality", settings.quality, running);
+  setSeg("seg-backend", settings.backend, running);
+  document.body.classList.toggle("per-clip", !settings.sameForAll);
+  $("same-all").checked = settings.sameForAll;
+  $("same-all").disabled = running;
+  $("same-sub").textContent = settings.sameForAll
+    ? "Applies to every clip in the queue"
+    : "Each clip keeps its own settings";
+  $("label-resolution").textContent = settings.sameForAll ? "Resolution" : "Default resolution";
+  $("label-quality").textContent = settings.sameForAll ? "Quality" : "Default quality";
+  $("resolution-note").textContent = RESOLUTION_NOTES[settings.resolution];
+  const q = QUALITY[settings.quality];
+  $("quality-title").textContent = `Q${settings.quality} ${q.title}`;
+  $("quality-saving").textContent = q.saving;
+  $("quality-text").textContent = q.text;
+  $("quality-meter").style.width = `${q.keep * 100}%`;
+  $("quality-meter-label").textContent = `about ${Math.round(q.keep * 100)}% of the original`;
+  $("backend-note").textContent = backendNote();
+  $("seg-backend").classList.toggle("inactive", !anyResize());
+  const custom = settings.dest === "custom" && settings.outputFolder;
+  setSeg("seg-dest", custom ? "custom" : "next", running);
+  $("dest-custom").textContent = custom ? "Folder" : "Choose folder";
+  const hint = $("dest-hint");
+  if (custom) {
+    hint.textContent = "";
+    hint.title = "File names are kept. A second version of a clip goes into a sub-folder named after its setting.";
+    const path = document.createElement("span");
+    path.className = "dest-path";
+    path.textContent = settings.outputFolder;
+    path.title = settings.outputFolder;
+    const change = document.createElement("a");
+    change.textContent = "Change";
+    change.className = "link";
+    change.addEventListener("click", chooseOutput);
+    hint.append(path, change);
+  } else {
+    hint.textContent = settings.sameForAll
+      ? `In a “Compressed ${variantName(settings.quality, settings.resolution)}” folder beside each clip.`
+      : "In a “Compressed Q…” folder beside each clip, named after its setting.";
+  }
+  const chip = $("engine-chip");
+  chip.classList.toggle("cpu", settings.backend === "cpu");
+  $("engine-text").textContent = settings.backend === "cpu" || !info.gpuAvailable ? (info.cpu || "CPU") : (info.gpu || "GPU");
+}
+
+// Quality-only jobs are entropy coding, which is bit-serial and runs on the CPU whatever is
+// chosen; only resizing has GPU work. Say which applies to the current queue.
+function anyResize() {
+  const pending = jobs.filter((j) => j.ok && j.state === "waiting");
+  return pending.length ? pending.some((j) => resizes(j, resolutionOf(j))) : settings.resolution !== "original";
+}
+function backendNote() {
+  const gpuName = (info.gpu || "").replace(/^[^:]*:\s*/, "");
+  if (!anyResize()) {
+    return "Not used at the original resolution. Changing only the quality re-does the bit-level entropy coding, " +
+      "which runs on the CPU cores; there is no GPU work in it.";
+  }
+  if (settings.backend === "cpu") return "6K and 4K resizing runs on the CPU cores, about two to three times slower.";
+  if (!info.gpuAvailable) return "No supported GPU found, so 6K and 4K resizing runs on the CPU cores.";
+  return `6K and 4K resizing runs on the ${gpuName || "GPU"}; the entropy coding around it stays on the CPU. ` +
+    "Matches the CPU result to within float rounding.";
+}
+
+// Queue ------------------------------------------------------------------------
+
+async function addPaths(paths) {
+  if (!paths || !paths.length || running) return;
+  const clips = await api.invoke("scan", { paths });
+  const known = new Set(jobs.filter((j) => j.state === "waiting").map((j) => j.path));
+  let added = 0;
+  for (const c of clips) {
+    if (known.has(c.path)) continue;
+    known.add(c.path);
+    jobs.push({
+      ...c, id: nextId++, state: c.ok ? "waiting" : "failed", fraction: 0, rate: 0, target: null,
+      quality: settings.quality, resolution: settings.resolution,
+    });
+    added++;
+  }
+  if (added) {
+    await planTargets();
+    renderAll();
+    loadThumbs();
+  }
+}
+
+// Adds a fresh copy of a finished clip to the queue, right after it, to compress it again
+// with other settings. Failed and cancelled clips are simply reset.
+async function again(id) {
+  if (running) return;
+  const j = jobs.find((x) => x.id === id);
+  if (!j || !j.ok) return;
+  if (j.state === "failed" || j.state === "cancelled") {
+    Object.assign(j, { state: "waiting", error: null, fraction: 0, rate: 0 });
+    renderAll();
+    return;
+  }
+  const copy = {
+    ...j, id: nextId++, state: "waiting", fraction: 0, rate: 0, result: null, output: null, ran: null, inRun: false,
+    quality: j.ran ? j.ran.quality : j.quality, resolution: j.ran ? j.ran.resolution : j.resolution,
+  };
+  copy.target = await targetFor(copy, resolutionOf(copy));
+  jobs.splice(jobs.indexOf(j) + 1, 0, copy);
+  renderAll();
+  const el = jobCard(copy);
+  el.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  el.classList.add("flash");
+  setTimeout(() => el.classList.remove("flash"), 1200);
+}
+
+// Clip thumbnails: one decode per clip, one at a time, in the background.
+const thumbs = new Map(); // path -> ImageBitmap | "pending" | "failed"
+let thumbsBusy = false;
+async function loadThumbs() {
+  if (thumbsBusy) return;
+  const j = jobs.find((x) => x.ok && !thumbs.has(x.path));
+  if (!j) return;
+  thumbsBusy = true;
+  thumbs.set(j.path, "pending");
+  try {
+    const buf = await api.invoke("thumbnail", { path: j.path, width: Math.round(96 * dpr()) });
+    const bytes = buf instanceof ArrayBuffer ? buf : new Uint8Array(buf).buffer;
+    const dv = new DataView(bytes);
+    const w = dv.getUint32(0, true), h = dv.getUint32(4, true);
+    thumbs.set(j.path, await createImageBitmap(new ImageData(new Uint8ClampedArray(bytes, 8, w * h * 4), w, h)));
+  } catch {
+    thumbs.set(j.path, "failed");
+  }
+  thumbsBusy = false;
+  for (const x of jobs) if (x.path === j.path) drawThumb(x);
+  loadThumbs();
+}
+
+function drawThumb(j) {
+  const c = jobCard(j).querySelector(".job-thumb-img");
+  const t = thumbs.get(j.path);
+  if (!(t instanceof ImageBitmap)) { c.classList.remove("ready"); return; }
+  if (c.drawn === t) return;
+  c.width = t.width; c.height = t.height;
+  c.getContext("2d").drawImage(t, 0, 0);
+  c.drawn = t;
+  c.classList.add("ready");
+}
+
+const targetCache = new Map();
+async function targetFor(j, res) {
+  if (res === "original") return null;
+  const key = `${j.width}x${j.height}@${res}`;
+  if (!targetCache.has(key)) targetCache.set(key, await api.invoke("plan_output", { width: j.width, height: j.height, resolution: res }));
+  return targetCache.get(key);
+}
+
+async function planTargets() {
+  await Promise.all(jobs.filter((j) => j.ok && j.state === "waiting").map(async (j) => {
+    j.target = await targetFor(j, resolutionOf(j));
+  }));
+}
+
+function jobCard(j) {
+  let el = els.get(j.id);
+  if (el) return el;
+  el = $("tpl-job").content.firstElementChild.cloneNode(true);
+  el.dataset.id = j.id;
+  const job = () => jobs.find((x) => x.id === j.id);
+  el.querySelector(".job-remove").addEventListener("click", (e) => { e.stopPropagation(); removeJob(j.id); });
+  el.querySelector(".job-reveal").addEventListener("click", (e) => {
+    e.stopPropagation();
+    const x = job();
+    api.invoke("reveal", { path: x.state === "done" ? x.output : x.path }).catch(() => {});
+  });
+  el.querySelector(".job-preview").addEventListener("click", (e) => { e.stopPropagation(); openViewer(job()); });
+  el.querySelector(".job-again").addEventListener("click", (e) => { e.stopPropagation(); again(j.id); });
+  const qSel = el.querySelector(".job-q"), rSel = el.querySelector(".job-r");
+  for (const sel of [qSel, rSel]) sel.addEventListener("click", (e) => e.stopPropagation());
+  qSel.addEventListener("change", () => { const x = job(); x.quality = Number(qSel.value); updateCard(x); renderFooter(); });
+  rSel.addEventListener("change", async () => {
+    const x = job(); x.resolution = rSel.value; x.target = await targetFor(x, x.resolution); updateCard(x); renderFooter();
+  });
+  el.addEventListener("click", () => { const x = job(); if (x.ok) openViewer(x); });
+  els.set(j.id, el);
+  return el;
+}
+
+function updateCard(j) {
+  const el = jobCard(j);
+  el.className = `job ${j.state}${viewer.job && viewer.job.id === j.id ? " selected" : ""}`;
+  const thumb = el.querySelector(".job-thumb");
+  thumb.className = `job-thumb${j.codec === "R3D NE" ? " r3d" : ""}${j.ok ? "" : " bad"}`;
+  el.querySelector(".job-codec").textContent = j.ok ? j.codec : "?";
+  drawThumb(j);
+  el.querySelector(".job-name").textContent = j.name;
+  el.title = j.ok ? `${j.path}\nClick to preview the quality` : j.path;
+
+  const pill = el.querySelector(".job-pill");
+  const pills = { waiting: "Waiting", running: "Compressing", done: "Done", failed: "Failed", cancelled: "Cancelled" };
+  pill.textContent = j.state === "failed" && !j.ok ? "Unreadable" : pills[j.state];
+  pill.className = `job-pill ${j.state}`;
+
+  const meta = el.querySelector(".job-meta");
+  if (!j.ok || (j.state === "failed" && j.error)) {
+    meta.className = "job-meta error";
+    meta.textContent = j.error || "Could not read this clip";
+  } else {
+    meta.className = "job-meta";
+    const sep = '<span class="sep">·</span>';
+    let html = `${j.width} × ${j.height}${sep}${j.frames} frames${sep}${j.fps.toFixed(j.fps % 1 ? 3 : 0)} fps${sep}${gb(j.bytes)}`;
+    const t = j.state === "done" ? j.resultTarget : j.target;
+    if (t && (t[0] !== j.width || t[1] !== j.height)) html += `${sep}<span class="target">→ ${t[0]} × ${t[1]}</span>`;
+    else if (t && j.state === "waiting") html += `${sep}stays at this size`;
+    meta.innerHTML = html;
+  }
+
+  const after = el.querySelector(".job-after"), againBtn = el.querySelector(".job-again");
+  const finished = j.ok && (j.state === "done" || j.state === "failed" || j.state === "cancelled");
+  after.hidden = !finished;
+  if (finished) {
+    const info = el.querySelector(".job-after-info");
+    if (j.state === "done" && j.ran) {
+      const folder = j.output ? j.output.split(/[\\/]/).slice(-2, -1)[0] : "";
+      info.innerHTML = `${esc(settingLabel(j.ran.quality, j.ran.resolution))}<span class="sep">·</span>` +
+        `<span class="job-out" title="${esc(j.output || "")}">${esc(folder)}/</span>`;
+    } else {
+      info.textContent = j.ran ? settingLabel(j.ran.quality, j.ran.resolution) : "";
+    }
+    againBtn.textContent = j.state === "done" ? "Compress again" : "Try again";
+    againBtn.title = j.state === "done"
+      ? "Add this clip to the queue again, to make another version with different settings"
+      : "Put this clip back in the queue";
+    againBtn.disabled = running;
+  }
+
+  const qSel = el.querySelector(".job-q"), rSel = el.querySelector(".job-r");
+  qSel.value = String(j.quality);
+  rSel.value = j.resolution;
+  rSel.options[1].disabled = j.width <= 6060;
+  rSel.options[2].disabled = j.width <= 3852;
+  qSel.disabled = rSel.disabled = running || j.state !== "waiting" || !j.ok;
+
+  const stat = el.querySelector(".job-stat"), sub = el.querySelector(".job-stat-sub");
+  const fill = el.querySelector(".job-progress-fill");
+  if (j.state === "running") {
+    stat.textContent = `${Math.floor(j.fraction * 100)}%`;
+    const left = j.rate > 0 ? (1 - j.fraction) * j.frames / j.rate : NaN;
+    sub.textContent = j.rate > 0 ? `${fpsText(j.rate)} fps · ${clock(left)} left` : "Starting";
+    fill.style.width = `${j.fraction * 100}%`;
+  } else if (j.state === "done") {
+    const r = j.result;
+    const saved = 1 - r.outputBytes / Math.max(1, r.inputBytes);
+    stat.innerHTML = `${gb(r.outputBytes)} <span class="good">−${(saved * 100).toFixed(1)}%</span>`;
+    const onGpu = r.backend !== "CPU";
+    const resized = j.ran && resizes(j, j.ran.resolution);
+    const how = resized
+      ? `resized on ${onGpu ? r.backend.replace(/\s*\(.*\)$/, "") + " GPU" : "CPU"}`
+      : "requantized on CPU";
+    sub.textContent = `${duration(r.seconds)} · ${fpsText(r.fps)} fps · ${how}`;
+    sub.title = resized
+      ? `Resized on ${r.backend}; entropy coding on the CPU`
+      : "At the original resolution only the entropy coding is redone, which runs on the CPU. The GPU is used for 6K and 4K.";
+    fill.style.width = "100%";
+  } else if (j.state === "waiting" && j.ok) {
+    const est = estimateBytes(j);
+    sub.title = "";
+    stat.textContent = `≈ ${gb(est.bytes)}`;
+    sub.textContent = est.measured ? "measured in preview" : "estimated";
+    fill.style.width = "0";
+  } else {
+    stat.textContent = "";
+    sub.title = "";
+    sub.textContent = j.state === "cancelled" ? "Partial output removed" : "";
+    fill.style.width = "0";
+  }
+  el.querySelector(".job-reveal").hidden = !(j.state === "done" || j.ok);
+  el.querySelector(".job-reveal").title = j.state === "done" ? `${revealLabel()} (compressed copy)` : revealLabel();
+  el.querySelector(".job-preview").hidden = !j.ok;
+  el.querySelector(".job-remove").hidden = running;
+}
+
+function revealLabel() {
+  return info.platform === "macos" ? "Show in Finder" : info.platform === "windows" ? "Show in Explorer" : "Show in folder";
+}
+
+function areaRatio(j, t) {
+  return t ? (t[0] * t[1]) / (j.width * j.height) : 1;
+}
+
+// Size estimate for a job's current settings: the ratio measured in a preview when there is
+// one, otherwise the calibrated typical ratio for the quality.
+function estimateBytes(j) {
+  const q = qualityOf(j), r = resolutionOf(j);
+  const m = measured.get(`${j.path}|${q}|${r}`);
+  if (m != null) return { bytes: j.bytes * m, measured: true };
+  return { bytes: j.bytes * QUALITY[q].keep * areaRatio(j, j.target), measured: false };
+}
+
+function removeJob(id) {
+  if (running) return;
+  if (viewer.job && viewer.job.id === id) closeViewer();
+  jobs = jobs.filter((j) => j.id !== id);
+  const el = els.get(id);
+  if (el) { el.remove(); els.delete(id); }
+  renderAll();
+}
+
+function clearFinished() {
+  if (running) return;
+  for (const j of jobs.filter((x) => x.state !== "waiting")) {
+    const el = els.get(j.id);
+    if (el) el.remove();
+    els.delete(j.id);
+  }
+  jobs = jobs.filter((j) => j.state === "waiting");
+  renderAll();
+}
+
+function renderAll() {
+  const list = $("list");
+  $("empty").hidden = jobs.length > 0;
+  list.hidden = jobs.length === 0;
+  // Keep the cards in queue order (a copy made by "Compress again" sits under its original).
+  let prev = null;
+  for (const j of jobs) {
+    const el = jobCard(j);
+    const want = prev ? prev.nextSibling : list.firstChild;
+    if (el !== want) list.insertBefore(el, want);
+    prev = el;
+    updateCard(j);
+  }
+  renderFooter();
+  renderSettings();
+}
+
+function renderFooter() {
+  const ok = jobs.filter((j) => j.ok);
+  const waiting = ok.filter((j) => j.state === "waiting");
+  const done = jobs.filter((j) => j.state === "done");
+  const total = ok.reduce((s, j) => s + j.bytes, 0);
+  $("queue-meta").textContent = jobs.length ? `${jobs.length} clip${jobs.length === 1 ? "" : "s"} · ${gb(total)}` : "";
+  $("btn-clear").disabled = running || !jobs.some((j) => j.state !== "waiting");
+  $("btn-add").disabled = $("btn-add-folder").disabled = running;
+
+  const go = $("btn-go");
+  go.classList.toggle("stop", running);
+  $("go-icon").innerHTML = running
+    ? '<rect x="4" y="4" width="8" height="8" rx="1.5" class="fill"/>'
+    : '<path d="M4.5 3.2v9.6L12.5 8 4.5 3.2Z" class="fill"/>';
+  $("go-label").textContent = running ? "Stop" : waiting.length ? `Compress ${waiting.length} clip${waiting.length === 1 ? "" : "s"}` : "Compress";
+  go.disabled = !running && waiting.length === 0;
+
+  const main = $("bar-main"), sub = $("bar-sub"), fill = $("bar-fill");
+  const savedIn = done.reduce((s, j) => s + j.result.inputBytes, 0);
+  const savedOut = done.reduce((s, j) => s + j.result.outputBytes, 0);
+  if (running) {
+    const active = ok.filter((j) => j.inRun);
+    const frames = active.reduce((s, j) => s + j.frames, 0);
+    const doneFrames = active.reduce((s, j) => s + (j.state === "done" ? j.frames : j.state === "running" ? j.fraction * j.frames : 0), 0);
+    const cur = jobs.find((j) => j.state === "running");
+    const idx = active.indexOf(cur) + 1;
+    const fps = cur ? cur.rate : 0;
+    main.textContent = cur ? `Compressing ${idx} of ${active.length}` : "Preparing";
+    sub.textContent = fps > 0 ? `${fpsText(fps)} fps · about ${clock((frames - doneFrames) / fps)} left for the queue` : cur ? cur.name : "";
+    fill.style.width = frames ? `${(doneFrames / frames) * 100}%` : "0";
+  } else if (done.length) {
+    const pct = (1 - savedOut / Math.max(1, savedIn)) * 100;
+    main.innerHTML = `Saved ${gb(savedIn - savedOut)} <span class="good">−${pct.toFixed(1)}%</span>`;
+    sub.textContent = `${done.length} clip${done.length === 1 ? "" : "s"} · ${gb(savedIn)} → ${gb(savedOut)}` +
+      (waiting.length ? ` · ${waiting.length} waiting` : "");
+    fill.style.width = "0";
+  } else if (waiting.length) {
+    const est = waiting.reduce((s, j) => s + estimateBytes(j).bytes, 0);
+    const tw = waiting.reduce((s, j) => s + j.bytes, 0);
+    main.textContent = `${gb(tw)} → about ${gb(est)}`;
+    sub.textContent = settings.sameForAll
+      ? `Estimated for Q${settings.quality} ${QUALITY[settings.quality].title}` +
+        (settings.resolution !== "original" ? ` at ${RES_LABEL[settings.resolution]}` : "")
+      : "Estimated with each clip's own settings";
+    fill.style.width = "0";
+  } else {
+    main.textContent = jobs.length ? "Nothing to compress" : "No clips yet";
+    sub.textContent = jobs.length ? "Add clips or clear the finished ones" : "Add clips to see the estimated savings";
+    fill.style.width = "0";
+  }
+}
+
+// Running ----------------------------------------------------------------------
+
+async function start() {
+  const todo = jobs.filter((j) => j.ok && j.state === "waiting");
+  if (!todo.length) return;
+  for (const j of jobs) j.inRun = todo.includes(j);
+  for (const j of todo) j.ran = { quality: qualityOf(j), resolution: resolutionOf(j) };
+  running = true;
+  if (viewer.open) closeViewer();
+  renderAll();
+  try {
+    await api.invoke("start", {
+      jobs: todo.map((j) => ({ id: j.id, path: j.path, quality: j.ran.quality, resolution: j.ran.resolution })),
+      settings: { backend: settings.backend, outputFolder: settings.dest === "custom" ? settings.outputFolder : null },
+    });
+  } catch (e) {
+    running = false;
+    renderAll();
+  }
+}
+
+function stop() { api.invoke("cancel"); }
+
+function onEvents() {
+  const find = (id) => jobs.find((j) => j.id === id);
+  api.listen("job-start", (p) => {
+    const j = find(p.id); if (!j) return;
+    j.state = "running"; j.output = p.output; j.fraction = 0; j.rate = 0;
+    updateCard(j); renderFooter();
+    jobCard(j).scrollIntoView({ block: "nearest", behavior: "smooth" });
+  });
+  api.listen("job-progress", (p) => {
+    const j = find(p.id); if (!j) return;
+    j.fraction = p.fraction; j.rate = p.fps;
+    updateCard(j); renderFooter();
+  });
+  api.listen("job-done", (p) => {
+    const j = find(p.id); if (!j) return;
+    j.state = "done"; j.result = p; j.output = p.output; j.resultTarget = j.target;
+    updateCard(j); renderFooter();
+  });
+  api.listen("job-error", (p) => {
+    const j = find(p.id); if (!j) return;
+    j.state = p.cancelled ? "cancelled" : "failed";
+    j.error = p.cancelled ? null : p.error;
+    updateCard(j); renderFooter();
+  });
+  api.listen("queue-finished", () => {
+    running = false;
+    for (const j of jobs) j.inRun = false;
+    renderAll();
+  });
+  api.listen("open-paths", (paths) => addPaths(paths));
+  api.listen("quit-requested", () => $("quit-modal").classList.add("show"));
+}
+
+// Quality previewer ------------------------------------------------------------
+//
+// Coordinates: the frame is a grid of QW x QH CFA quads (half the sensor size), and `scale`
+// is device pixels per quad, so 100% shows one quad per screen pixel. (cx, cy) is the frame
+// point at the centre of the stage, in fractions of the frame.
+//
+// Two layers are drawn, each as before everywhere and after right of the split line:
+// a fit-size "base" image of the whole frame, and when zoomed in a "region" image rendered
+// by the core for exactly the visible part at screen resolution. While a new region is on
+// its way the previous one stays in place over a soft upscale of the base, so panning and
+// zooming never show a blank stage. The core keeps the last decoded frame, which makes
+// region renders for the same frame and settings cheap; a new frame or setting decodes.
+
+const viewer = {
+  open: false, job: null, frame: 0, quality: 2, resolution: "original",
+  split: 0.5, scale: 1, fit: true, cx: 0.5, cy: 0.5,
+  base: null, region: null,
+};
+const baseCache = new Map();    // path|frame|q|r -> layer
+const regionCache = new Map();  // path|frame|q|r|crop|width -> layer
+const measured = new Map();     // path|q|r -> output/source frame ratio
+const BASE_LIMIT = 10, REGION_LIMIT = 6;
+const sched = { busy: false, slowTimer: 0 };
+
+const settingsKey = (j, f, q, r) => `${j.path}|${f}|${q}|${r}`;
+const currentKey = () => settingsKey(viewer.job, viewer.frame, viewer.quality, viewer.resolution);
+const quadW = () => Math.max(1, Math.floor(viewer.job.width / 2));
+const quadH = () => Math.max(1, Math.floor(viewer.job.height / 2));
+const dpr = () => window.devicePixelRatio || 1;
+
+function lruSet(map, key, value, limit) {
+  map.delete(key);
+  map.set(key, value);
+  while (map.size > limit) {
+    const k = map.keys().next().value;
+    const old = map.get(k);
+    map.delete(k);
+    if (old !== viewer.base && old !== viewer.region) { old.before.close?.(); old.after.close?.(); }
+  }
+}
+function lruGet(map, key) {
+  const v = map.get(key);
+  if (v) { map.delete(key); map.set(key, v); }
+  return v;
+}
+
+function openViewer(j) {
+  viewer.open = true;
+  viewer.job = j;
+  viewer.frame = Math.floor((j.frames - 1) / 2);
+  viewer.quality = qualityOf(j);
+  viewer.resolution = resolutionOf(j);
+  viewer.split = 0.5;
+  viewer.fit = true;
+  viewer.cx = viewer.cy = 0.5;
+  viewer.base = viewer.region = null;
+  const range = $("v-frame");
+  range.max = String(Math.max(0, j.frames - 1));
+  range.value = String(viewer.frame);
+  $("v-name").textContent = j.name;
+  $("v-meta").textContent = `${j.codec} · ${j.width} × ${j.height} · ${j.frames} frames · ${j.fps.toFixed(j.fps % 1 ? 3 : 0)} fps · ${gb(j.bytes)}`;
+  $("v-error").classList.remove("show");
+  const hint = $("v-hint");
+  hint.classList.remove("hide");
+  clearTimeout(hint.timer);
+  hint.timer = setTimeout(() => hint.classList.add("hide"), 4500);
+  $("viewer").classList.add("show");
+  for (const x of jobs) updateCard(x);
+  sizeCanvas();
+  viewer.scale = fitScale();
+  syncLayers();
+  renderViewerControls();
+  draw();
+  pump();
+}
+
+function closeViewer() {
+  viewer.open = false;
+  viewer.job = null;
+  setLoading(false);
+  $("viewer").classList.remove("show");
+  for (const x of jobs) updateCard(x);
+  renderFooter();
+}
+
+function renderViewerControls() {
+  const j = viewer.job;
+  if (!j) return;
+  setSeg("v-quality", viewer.quality, null);
+  setSeg("v-res", viewer.resolution, null);
+  for (const b of $("v-res").querySelectorAll("button")) {
+    b.disabled = (b.dataset.value === "6k" && j.width <= 6060) || (b.dataset.value === "4k" && j.width <= 3852);
+    b.title = b.disabled ? "This clip is already at or below this size" : "";
+  }
+  renderZoomControls();
+  renderFrameLabel();
+  const shown = viewer.region || viewer.base;
+  const q = shown ? shown.quality : viewer.quality, r = shown ? shown.resolution : viewer.resolution;
+  $("v-tag-after").innerHTML = `<b>Q${q}</b> ${esc(QUALITY[q].title)}${r !== "original" ? " · " + esc(RES_LABEL[r]) : ""}`;
+  const same = qualityOf(j) === viewer.quality && resolutionOf(j) === viewer.resolution;
+  const apply = $("v-apply");
+  apply.textContent = settings.sameForAll ? "Use for all clips" : "Apply to this clip";
+  apply.disabled = same || running || j.state !== "waiting";
+  apply.title = same ? "These are the settings it will be compressed with" : "";
+  renderEstimate();
+}
+
+function renderFrameLabel(frame = viewer.frame) {
+  const j = viewer.job;
+  $("v-frame").style.setProperty("--p", `${(frame / Math.max(1, j.frames - 1)) * 100}%`);
+  $("v-frame-label").textContent = `Frame ${frame + 1} of ${j.frames}`;
+  $("v-tc").textContent = timecode(frame, j.fps);
+}
+
+function renderZoomControls() {
+  const pct = viewer.scale * 100;
+  setSeg("v-zoom", viewer.fit ? "fit" : Math.abs(pct - 100) < 0.5 ? "1" : Math.abs(pct - 200) < 0.5 ? "2" : "", null);
+  $("stage").classList.toggle("zoomed", !viewer.fit);
+  $("v-zoom-badge").textContent = `${pct >= 99.5 ? Math.round(pct) : pct.toFixed(0)}%`;
+}
+
+function renderEstimate() {
+  const j = viewer.job;
+  const layer = baseCache.get(currentKey()) || (viewer.region && viewer.region.key === currentKey() ? viewer.region : null);
+  const ratio = layer ? layer.ratio : measured.get(`${j.path}|${viewer.quality}|${viewer.resolution}`);
+  if (ratio == null) {
+    $("v-est-main").textContent = "Estimating…";
+    $("v-est-sub").textContent = `Q${viewer.quality} ${QUALITY[viewer.quality].title}`;
+    return;
+  }
+  $("v-est-main").innerHTML = `≈ ${gb(j.bytes * ratio)} <span class="good">−${((1 - ratio) * 100).toFixed(1)}%</span>`;
+  $("v-est-sub").textContent = layer
+    ? `This frame ${gb(layer.src)} → ${gb(layer.out)}, extrapolated to the clip`
+    : "From another frame, extrapolated to the clip";
+}
+
+// Pick the layers to show for the current frame and settings from the caches. Layers of an
+// earlier choice stay up until the new ones arrive, so the stage never goes blank.
+function syncLayers() {
+  const key = currentKey();
+  const base = lruGet(baseCache, key);
+  if (base) viewer.base = base;
+  const r = lruGet(regionCache, regionKey());
+  if (r) viewer.region = r;
+  else if (viewer.region && viewer.region.key !== key && (base || viewer.fit)) viewer.region = null;
+  if (viewer.fit && viewer.base && viewer.base.key === key) viewer.region = null;
+}
+
+// Geometry ---------------------------------------------------------------------
+
+function sizeCanvas() {
+  const c = $("v-canvas"), st = $("stage");
+  c.width = Math.max(1, Math.round(st.clientWidth * dpr()));
+  c.height = Math.max(1, Math.round(st.clientHeight * dpr()));
+}
+
+function fitScale() {
+  const c = $("v-canvas");
+  return Math.min(c.width / quadW(), c.height / quadH());
+}
+
+function clampView() {
+  const c = $("v-canvas");
+  const fw = quadW() * viewer.scale, fh = quadH() * viewer.scale;
+  const hx = c.width / 2 / fw, hy = c.height / 2 / fh;
+  viewer.cx = hx >= 0.5 ? 0.5 : Math.min(1 - hx, Math.max(hx, viewer.cx));
+  viewer.cy = hy >= 0.5 ? 0.5 : Math.min(1 - hy, Math.max(hy, viewer.cy));
+}
+
+// The frame's rectangle on the canvas in device pixels.
+function frameRect() {
+  const c = $("v-canvas");
+  const w = quadW() * viewer.scale, h = quadH() * viewer.scale;
+  return { x: c.width / 2 - viewer.cx * w, y: c.height / 2 - viewer.cy * h, w, h };
+}
+
+// The visible part of the frame, in fractions, snapped so tiny pans reuse a render.
+function visibleCrop() {
+  const c = $("v-canvas"), f = frameRect();
+  const snap = (v) => Math.round(v * 4096) / 4096;
+  const x0 = snap(Math.max(0, -f.x / f.w)), y0 = snap(Math.max(0, -f.y / f.h));
+  const x1 = snap(Math.min(1, (c.width - f.x) / f.w)), y1 = snap(Math.min(1, (c.height - f.y) / f.h));
+  return [x0, y0, Math.max(1 / 4096, x1 - x0), Math.max(1 / 4096, y1 - y0)];
+}
+
+function regionKey() {
+  if (!viewer.job || viewer.fit) return "";
+  const crop = visibleCrop();
+  const width = Math.round(crop[2] * quadW() * viewer.scale);
+  return `${currentKey()}|${crop.join(",")}|${width}`;
+}
+
+function zoomTo(scale, anchor) {
+  const c = $("v-canvas");
+  const fs = fitScale();
+  scale = Math.min(8, Math.max(fs, scale));
+  const ax = anchor ? anchor.x * dpr() : c.width / 2, ay = anchor ? anchor.y * dpr() : c.height / 2;
+  const f = frameRect();
+  const u = (ax - f.x) / f.w, v = (ay - f.y) / f.h;
+  viewer.scale = scale;
+  viewer.fit = scale <= fs * 1.001;
+  if (viewer.fit) {
+    viewer.scale = fs;
+    viewer.cx = viewer.cy = 0.5;
+  } else {
+    viewer.cx = (c.width / 2 - (ax - u * quadW() * scale)) / (quadW() * scale);
+    viewer.cy = (c.height / 2 - (ay - v * quadH() * scale)) / (quadH() * scale);
+    clampView();
+  }
+  $("v-hint").classList.add("hide");
+  syncLayers();
+  renderZoomControls();
+  draw();
+  pump();
+}
+
+// Drawing ----------------------------------------------------------------------
+
+let drawQueued = false;
+function draw() {
+  if (drawQueued) return;
+  drawQueued = true;
+  requestAnimationFrame(() => {
+    drawQueued = false;
+    if (!viewer.open) return;
+    const c = $("v-canvas");
+    const ctx = c.getContext("2d");
+    ctx.clearRect(0, 0, c.width, c.height);
+    const splitX = Math.round(viewer.split * c.width);
+    $("v-split").style.left = `${viewer.split * 100}%`;
+    const f = frameRect();
+    const layers = [];
+    if (viewer.base) layers.push({ l: viewer.base, x: f.x, y: f.y, w: f.w, h: f.h });
+    if (viewer.region && !viewer.fit) {
+      const [x, y, w, h] = viewer.region.crop;
+      layers.push({ l: viewer.region, x: f.x + x * f.w, y: f.y + y * f.h, w: w * f.w, h: h * f.h });
+    }
+    for (const { l, x, y, w, h } of layers) {
+      // Magnified renders show quads as crisp blocks; the base is only a soft stand-in.
+      ctx.imageSmoothingEnabled = l === viewer.base ? true : w < l.w * 0.999;
+      ctx.imageSmoothingQuality = "high";
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(0, 0, splitX, c.height);
+      ctx.clip();
+      ctx.drawImage(l.before, x, y, w, h);
+      ctx.restore();
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(splitX, 0, c.width - splitX, c.height);
+      ctx.clip();
+      ctx.drawImage(l.after, x, y, w, h);
+      ctx.restore();
+    }
+    drawMinimap();
+  });
+}
+
+function drawMinimap() {
+  const mini = $("v-mini-canvas");
+  if (viewer.fit || !viewer.base) return;
+  const w = 168 * dpr(), h = Math.round(w * quadH() / quadW());
+  if (mini.width !== w || mini.height !== h) { mini.width = w; mini.height = h; mini.drawn = null; }
+  const ctx = mini.getContext("2d");
+  if (mini.drawn !== viewer.base) {
+    ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(viewer.base.after, 0, 0, w, h);
+    mini.drawn = viewer.base;
+  }
+  const [x, y, cw, ch] = visibleCrop();
+  const view = $("v-mini-view").style;
+  view.left = `${x * 100}%`; view.top = `${y * 100}%`;
+  view.width = `${cw * 100}%`; view.height = `${ch * 100}%`;
+}
+
+// Requests ---------------------------------------------------------------------
+//
+// One request at a time. Each time the engine is free, the next one is chosen from the
+// current state, so whatever the user did last wins and stale work is never queued.
+
+function nextRequest() {
+  const j = viewer.job;
+  if (!viewer.open || !j) return null;
+  const key = currentKey();
+  const common = { job: j, frame: viewer.frame, quality: viewer.quality, resolution: viewer.resolution, key };
+  const c = $("v-canvas");
+  const baseReq = baseCache.has(key) ? null : { ...common, kind: "base", crop: [0, 0, 1, 1], width: Math.round(Math.min(quadW(), quadW() * fitScale(), c.width)) };
+  let regionReq = null;
+  if (!viewer.fit) {
+    const rk = regionKey();
+    if (!regionCache.has(rk)) {
+      const crop = visibleCrop();
+      regionReq = { ...common, kind: "region", crop, width: Math.min(8192, Math.round(crop[2] * quadW() * viewer.scale)), rkey: rk };
+    }
+  }
+  // Zoomed in, the region is what the user is looking at; the base follows from the same decode.
+  return viewer.fit ? baseReq : regionReq || baseReq;
+}
+
+async function pump() {
+  if (sched.busy) return;
+  const req = nextRequest();
+  if (!req) { setLoading(false); return; }
+  sched.busy = true;
+  // Only renders that need a decode take long enough to deserve the spinner.
+  clearTimeout(sched.slowTimer);
+  sched.slowTimer = setTimeout(() => setLoading(true, loadingText(req)), 160);
+  try {
+    const buf = await api.invoke("preview", {
+      path: req.job.path, frame: req.frame, quality: req.quality, resolution: req.resolution,
+      backend: settings.backend, width: Math.max(16, req.width), crop: req.crop,
+    });
+    const layer = await toLayer(req, buf);
+    if (req.kind === "base") lruSet(baseCache, req.key, layer, BASE_LIMIT);
+    else lruSet(regionCache, req.rkey, layer, REGION_LIMIT);
+    measured.set(`${req.job.path}|${req.quality}|${req.resolution}`, layer.ratio);
+    if (viewer.open && viewer.job === req.job) {
+      if (req.kind === "region" && req.key === currentKey()) viewer.region = layer;
+      if (req.kind === "base" && (req.key === currentKey() || !viewer.base)) viewer.base = layer;
+      syncLayers();
+      $("v-error").classList.remove("show");
+      renderViewerControls();
+      draw();
+    }
+    const j = jobs.find((x) => x.path === req.job.path);
+    if (j) updateCard(j);
+    renderFooter();
+  } catch (e) {
+    if (viewer.open && req.key === currentKey()) showError(String(e));
+    sched.busy = false;
+    clearTimeout(sched.slowTimer);
+    setLoading(false);
+    return;
+  }
+  sched.busy = false;
+  clearTimeout(sched.slowTimer);
+  setLoading(false);
+  pump();
+}
+
+function loadingText(req) {
+  const shown = viewer.region || viewer.base;
+  if (!shown || shown.frame !== req.frame) return `Decoding frame ${req.frame + 1}`;
+  if (shown.quality !== req.quality || shown.resolution !== req.resolution) return `Compressing at Q${req.quality}`;
+  return "Rendering";
+}
+
+async function toLayer(req, buf) {
+  const bytes = buf instanceof ArrayBuffer ? buf : new Uint8Array(buf).buffer;
+  const dv = new DataView(bytes);
+  const w = dv.getUint32(0, true), h = dv.getUint32(4, true);
+  const src = Number(dv.getBigUint64(16, true)), out = Number(dv.getBigUint64(24, true));
+  const n = w * h * 4;
+  const [before, after] = await Promise.all([
+    createImageBitmap(new ImageData(new Uint8ClampedArray(bytes, 32, n), w, h)),
+    createImageBitmap(new ImageData(new Uint8ClampedArray(bytes, 32 + n, n), w, h)),
+  ]);
+  return {
+    key: req.key, frame: req.frame, quality: req.quality, resolution: req.resolution, crop: req.crop,
+    before, after, w, h, src, out, ratio: src > 0 ? out / src : 1,
+  };
+}
+
+function setLoading(on, text) {
+  const el = $("v-loading");
+  el.classList.toggle("show", on);
+  el.classList.toggle("first", on && !viewer.base && !viewer.region);
+  if (text) $("v-loading-text").textContent = text;
+}
+
+function showError(msg) {
+  setLoading(false);
+  const el = $("v-error");
+  el.textContent = `Could not render a preview: ${msg}`;
+  el.classList.add("show");
+}
+
+// Input ------------------------------------------------------------------------
+
+function bindStage() {
+  const st = $("stage");
+  let drag = null;
+  const local = (e) => { const r = st.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; };
+  const nearSplit = (p) => Math.abs(p.x - viewer.split * st.clientWidth) < 14;
+  st.addEventListener("pointermove", (e) => {
+    if (e.target.closest(".v-mini")) return;
+    const p = local(e);
+    if (!drag) { st.classList.toggle("near-split", nearSplit(p)); return; }
+    const dx = p.x - drag.last.x, dy = p.y - drag.last.y;
+    drag.last = p;
+    if (Math.abs(p.x - drag.start.x) + Math.abs(p.y - drag.start.y) > 3) drag.moved = true;
+    if (drag.mode === "split") {
+      viewer.split = Math.min(1, Math.max(0, p.x / st.clientWidth));
+      draw();
+    } else if (!viewer.fit) {
+      viewer.cx -= (dx * dpr()) / (quadW() * viewer.scale);
+      viewer.cy -= (dy * dpr()) / (quadH() * viewer.scale);
+      clampView();
+      draw();
+      pump();
+    }
+  });
+  st.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0 || e.target.closest(".v-mini")) return;
+    const p = local(e);
+    drag = { start: p, last: p, mode: nearSplit(p) ? "split" : "pan", moved: false };
+    st.setPointerCapture(e.pointerId);
+    st.classList.toggle("dragging-split", drag.mode === "split");
+    st.classList.toggle("panning", drag.mode === "pan" && !viewer.fit);
+    $("v-hint").classList.add("hide");
+  });
+  const end = (e) => {
+    if (!drag) return;
+    const p = local(e);
+    if (!drag.moved && drag.mode === "pan" && (viewer.base || viewer.region)) zoomTo(viewer.fit ? 1 : 0, p);
+    drag = null;
+    st.classList.remove("dragging-split", "panning");
+    syncLayers();
+    draw();
+  };
+  st.addEventListener("pointerup", end);
+  st.addEventListener("pointercancel", end);
+  st.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    if (!viewer.base && !viewer.region) return;
+    // Pinch on a trackpad arrives as ctrl+wheel. A mouse wheel moves in coarse vertical
+    // notches and zooms too; trackpad scrolling pans.
+    const notch = e.deltaMode !== 0 || (e.deltaX === 0 && Math.abs(e.deltaY) >= 40 && Number.isInteger(e.deltaY));
+    if (e.ctrlKey || e.metaKey) {
+      zoomTo(viewer.scale * Math.exp(-e.deltaY * 0.012), local(e));
+    } else if (notch) {
+      zoomTo(viewer.scale * (e.deltaY > 0 ? 1 / 1.25 : 1.25), local(e));
+    } else if (!viewer.fit) {
+      viewer.cx += (e.deltaX * dpr()) / (quadW() * viewer.scale);
+      viewer.cy += (e.deltaY * dpr()) / (quadH() * viewer.scale);
+      clampView();
+      syncLayers();
+      draw();
+      pump();
+    }
+  }, { passive: false });
+
+  // Minimap: drag the view rectangle (or click anywhere) to move around the frame.
+  const mini = $("v-mini");
+  let miniDrag = false;
+  const moveTo = (e) => {
+    const r = mini.getBoundingClientRect();
+    viewer.cx = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
+    viewer.cy = Math.min(1, Math.max(0, (e.clientY - r.top) / r.height));
+    clampView();
+    syncLayers();
+    draw();
+    pump();
+  };
+  mini.addEventListener("pointerdown", (e) => { e.stopPropagation(); miniDrag = true; mini.setPointerCapture(e.pointerId); moveTo(e); });
+  mini.addEventListener("pointermove", (e) => { if (miniDrag) moveTo(e); });
+  mini.addEventListener("pointerup", () => { miniDrag = false; });
+
+  new ResizeObserver(() => {
+    if (!viewer.open) return;
+    const wasFit = viewer.fit;
+    sizeCanvas();
+    if (wasFit) viewer.scale = fitScale();
+    else viewer.scale = Math.max(viewer.scale, fitScale());
+    clampView();
+    syncLayers();
+    draw();
+    pump();
+  }).observe(st);
+}
+
+function bindViewer() {
+  $("v-close").addEventListener("click", closeViewer);
+  const choose = (q, r) => {
+    viewer.quality = q;
+    viewer.resolution = r;
+    $("v-hint").classList.add("hide");
+    syncLayers();
+    renderViewerControls();
+    draw();
+    pump();
+  };
+  $("v-quality").addEventListener("click", (e) => {
+    const b = e.target.closest("button"); if (b) choose(Number(b.dataset.value), viewer.resolution);
+  });
+  $("v-res").addEventListener("click", (e) => {
+    const b = e.target.closest("button"); if (b && !b.disabled) choose(viewer.quality, b.dataset.value);
+  });
+  $("v-zoom").addEventListener("click", (e) => {
+    const b = e.target.closest("button"); if (!b) return;
+    zoomTo(b.dataset.value === "fit" ? 0 : Number(b.dataset.value), null);
+  });
+
+  // The scrubber updates its label at once and asks for the frame when it settles.
+  const range = $("v-frame");
+  let debounce = 0;
+  const goFrame = (f, delay) => {
+    const j = viewer.job; if (!j) return;
+    f = Math.min(j.frames - 1, Math.max(0, f));
+    range.value = String(f);
+    renderFrameLabel(f);
+    clearTimeout(debounce);
+    debounce = setTimeout(() => {
+      viewer.frame = f;
+      syncLayers();
+      renderViewerControls();
+      draw();
+      pump();
+    }, delay);
+  };
+  range.addEventListener("input", () => goFrame(Number(range.value), 150));
+  $("v-prev").addEventListener("click", () => goFrame(Number(range.value) - 1, 60));
+  $("v-next").addEventListener("click", () => goFrame(Number(range.value) + 1, 60));
+
+  $("v-apply").addEventListener("click", async () => {
+    const j = viewer.job;
+    if (settings.sameForAll) {
+      settings.quality = viewer.quality;
+      settings.resolution = viewer.resolution;
+      saveSettings();
+      await planTargets();
+    } else {
+      j.quality = viewer.quality;
+      j.resolution = viewer.resolution;
+      j.target = await targetFor(j, j.resolution);
+    }
+    renderAll();
+    renderViewerControls();
+  });
+
+  document.addEventListener("keydown", (e) => {
+    if (!viewer.open || e.target.tagName === "SELECT" || e.metaKey || e.ctrlKey) return;
+    const k = e.key.toLowerCase();
+    if (e.key === "Escape") closeViewer();
+    else if (e.key === "ArrowLeft") { e.preventDefault(); goFrame(Number(range.value) - (e.shiftKey ? 10 : 1), 90); }
+    else if (e.key === "ArrowRight") { e.preventDefault(); goFrame(Number(range.value) + (e.shiftKey ? 10 : 1), 90); }
+    else if (["1", "2", "3", "4"].includes(e.key)) choose(Number(e.key), viewer.resolution);
+    else if (k === "f") zoomTo(0, null);
+    else if (k === "z") zoomTo(viewer.fit ? 1 : 0, null);
+    else if (e.key === "+" || e.key === "=") zoomTo(viewer.scale * 1.5, null);
+    else if (e.key === "-") zoomTo(viewer.scale / 1.5, null);
+  });
+  bindStage();
+}
+
+// Drag and drop ----------------------------------------------------------------
+
+function onDragDrop(p) {
+  const over = (p.type === "enter" || p.type === "over") && !viewer.open;
+  const empty = jobs.length === 0;
+  $("drop-zone").classList.toggle("over", over && empty && !running);
+  $("drop-overlay").classList.toggle("show", over && !empty && !running);
+  if (p.type === "drop" && !viewer.open) addPaths(p.paths);
+}
+
+// Wiring -----------------------------------------------------------------------
+
+async function chooseOutput() {
+  if (running) return;
+  const f = await api.invoke("pick_folder", { title: "Save Compressed Clips To" });
+  if (f) { settings.outputFolder = f; settings.dest = "custom"; }
+  saveSettings(); renderSettings();
+}
+async function pickClips() { if (!running) addPaths(await api.invoke("pick_clips")); }
+async function pickFolder() {
+  if (running) return;
+  const f = await api.invoke("pick_folder", { title: "Add Folder" });
+  if (f) addPaths([f]);
+}
+
+async function init() {
+  info = await api.invoke("app_info");
+  info.gpuAvailable = !!info.gpu && !/^(CPU|not available)/i.test(info.gpu);
+  document.body.classList.add(info.platform);
+  bindSeg("seg-resolution", "resolution");
+  bindSeg("seg-quality", "quality", Number);
+  bindSeg("seg-backend", "backend");
+  $("same-all").addEventListener("change", async (e) => {
+    settings.sameForAll = e.target.checked;
+    // Each clip starts from the settings it was getting until now.
+    if (!settings.sameForAll) for (const j of jobs) { j.quality = settings.quality; j.resolution = settings.resolution; }
+    saveSettings();
+    await planTargets();
+    renderAll();
+    if (viewer.open) renderViewerControls();
+  });
+  $("seg-dest").addEventListener("click", (e) => {
+    const b = e.target.closest("button");
+    if (!b || running) return;
+    if (b.dataset.value === "next") { settings.dest = "next"; saveSettings(); renderSettings(); }
+    else if (settings.dest === "custom" && settings.outputFolder) return;
+    else if (settings.outputFolder) { settings.dest = "custom"; saveSettings(); renderSettings(); }
+    else chooseOutput();
+  });
+  $("btn-add").addEventListener("click", pickClips);
+  $("btn-add-folder").addEventListener("click", pickFolder);
+  $("empty-add").addEventListener("click", pickClips);
+  $("empty-add-folder").addEventListener("click", pickFolder);
+  $("btn-clear").addEventListener("click", clearFinished);
+  $("btn-go").addEventListener("click", () => (running ? stop() : start()));
+  $("quit-cancel").addEventListener("click", () => $("quit-modal").classList.remove("show"));
+  $("beta-ok").addEventListener("click", () => {
+    $("beta-modal").classList.remove("show");
+    try { localStorage.setItem(BETA_ACK, "1"); } catch { /* private mode */ }
+  });
+  let acked = false;
+  try { acked = localStorage.getItem(BETA_ACK) === "1"; } catch { /* private mode */ }
+  if (!acked) $("beta-modal").classList.add("show");
+  $("quit-confirm").addEventListener("click", () => api.invoke("confirm_quit"));
+  document.addEventListener("keydown", (e) => {
+    const mod = e.metaKey || e.ctrlKey;
+    if (mod && e.key.toLowerCase() === "o") { e.preventDefault(); e.shiftKey ? pickFolder() : pickClips(); }
+    if (e.key === "Escape") $("quit-modal").classList.remove("show");
+  });
+  document.addEventListener("contextmenu", (e) => e.preventDefault());
+  bindViewer();
+  onEvents();
+  api.onDragDrop(onDragDrop);
+  running = await api.invoke("is_running");
+  renderAll();
+  addPaths(await api.invoke("initial_paths"));
+}
+
+init();
+
+// Browser stand-in (no Tauri): fake clips, progress and previews, for layout work only.
+function browserStandIn() {
+  const handlers = {};
+  const emit = (ev, p) => (handlers[ev] || []).forEach((f) => f(p));
+  let cancel = false;
+  let last = "";
+  const sample = [
+    ["/Volumes/CARD/DCIM/CLIP_0001.NEV", "N-RAW", 8268, 4652, 360, 2.60e9],
+    ["/Volumes/CARD/DCIM/CLIP_0002.NEV", "N-RAW", 8268, 4652, 1210, 8.74e9],
+    ["/Volumes/CARD/A001/A001_C001_0101AB.R3D", "R3D NE", 6060, 3410, 276, 2.14e9],
+  ];
+  const hash = (x, y, f) => {
+    let h = (x * 374761393 + y * 668265263 + f * 2147483647) | 0;
+    h = Math.imul(h ^ (h >>> 13), 1274126177);
+    return ((h ^ (h >>> 16)) >>> 0) / 4294967296 - 0.5;
+  };
+  const fakePreview = (a) => {
+    const clip = sample.find((s) => s[0] === a.path) || sample[0];
+    const qw = clip[2] / 2, qh = clip[3] / 2;
+    const [cx, cy, cw, ch] = a.crop;
+    const w = a.width, h = Math.max(1, Math.round(w * (ch * qh) / (cw * qw))), n = w * h * 4;
+    const buf = new ArrayBuffer(32 + 2 * n), dv = new DataView(buf);
+    dv.setUint32(0, w, true); dv.setUint32(4, h, true); dv.setUint32(8, clip[4], true);
+    const keep = { 1: 0.91, 2: 0.82, 3: 0.63, 4: 0.43 }[a.quality] * (a.resolution === "4k" ? 0.22 : a.resolution === "6k" ? 0.54 : 1);
+    dv.setBigUint64(16, 7200000n, true); dv.setBigUint64(24, BigInt(Math.round(7200000 * keep)), true);
+    const px = new Uint8Array(buf, 32);
+    const s = { 1: 0, 2: 0.3, 3: 0.55, 4: 0.85 }[a.quality];
+    for (let y = 0; y < h; y++) {
+      const qy = Math.floor((cy + ch * (y + 0.5) / h) * qh), fy = qy / qh;
+      for (let x = 0; x < w; x++) {
+        const qx = Math.floor((cx + cw * (x + 0.5) / w) * qw), fx = qx / qw;
+        const i = (y * w + x) * 4;
+        const hill = 0.55 + 0.08 * Math.sin(fx * 7 + a.frame / 60);
+        const leaf = 0.5 + 0.5 * Math.sin(fx * 180) * Math.cos(fy * 140);
+        const base = fy < hill ? [90 + 60 * (1 - fy), 130 + 50 * (1 - fy), 200 + 40 * (1 - fy)] : [30 * leaf + 10, 90 * leaf + 20, 30 * leaf + 10];
+        const noise = hash(qx, qy, a.frame) * 30;
+        const smooth = (hash(qx + 1, qy, a.frame) + hash(qx, qy + 1, a.frame) + hash(qx - 1, qy, a.frame)) * 10;
+        for (let c = 0; c < 3; c++) {
+          px[i + c] = base[c] + noise;
+          px[n + i + c] = base[c] + noise * (1 - s) + smooth * s;
+        }
+        px[i + 3] = px[n + i + 3] = 255;
+      }
+    }
+    return buf;
+  };
+  return {
+    listen: (ev, fn) => { (handlers[ev] ||= []).push(fn); },
+    onDragDrop: () => {},
+    invoke: async (cmd, a) => {
+      switch (cmd) {
+        case "app_info": return { version: "0.1.0", gpu: "Metal: Apple GPU", cpu: "CPU (12 threads)", platform: "macos" };
+        case "is_running": return false;
+        case "initial_paths": return location.hash === "#demo" ? ["demo"] : [];
+        case "scan": return sample.map(([path, codec, width, height, frames, bytes]) => ({
+          path, name: path.split("/").pop(), ok: true, codec, width, height, frames, fps: 25, bytes, error: null,
+        }));
+        case "plan_output": return a.resolution === "6k" && a.width > 6060 ? [6060, 3410] : a.resolution === "4k" ? [3852, 2168] : [a.width, a.height];
+        case "preview": {
+          const key = `${a.path}|${a.frame}|${a.quality}|${a.resolution}`;
+          await new Promise((r) => setTimeout(r, key === last ? 20 : 450));
+          last = key;
+          return fakePreview(a);
+        }
+        case "thumbnail": {
+          const p = new Uint8Array(fakePreview({ ...a, frame: 90, quality: 1, resolution: "original", crop: [0, 0, 1, 1] }));
+          const dv = new DataView(p.buffer);
+          const w = dv.getUint32(0, true), h = dv.getUint32(4, true);
+          const out = new Uint8Array(8 + w * h * 4);
+          out.set(p.subarray(0, 8)); out.set(p.subarray(32, 32 + w * h * 4), 8);
+          return out.buffer;
+        }
+        case "pick_clips": return ["demo"];
+        case "pick_folder": return "/Volumes/Archive/Compressed";
+        case "cancel": cancel = true; return;
+        case "start": {
+          cancel = false;
+          (async () => {
+            for (const j of a.jobs) {
+              if (cancel) break;
+              emit("job-start", { id: j.id, output: j.path });
+              const total = 60;
+              let i = 0;
+              for (; i <= total && !cancel; i++) {
+                await new Promise((r) => setTimeout(r, 40));
+                emit("job-progress", { id: j.id, fraction: i / total, fps: 38 + Math.random() * 4 });
+              }
+              if (cancel) { emit("job-error", { id: j.id, error: "cancelled", cancelled: true }); break; }
+              emit("job-done", { id: j.id, output: j.path, inputBytes: 2.6e9, outputBytes: 2.12e9, frames: 360, seconds: 9.1, fps: 39.6, backend: "CPU" });
+            }
+            emit("queue-finished", null);
+          })();
+          return;
+        }
+        default: return null;
+      }
+    },
+  };
+}

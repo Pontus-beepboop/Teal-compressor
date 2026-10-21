@@ -1,0 +1,90 @@
+/* Blue Compressor core: re-encodes Nikon N-RAW (.NEV) and R3D NE (.R3D) TICO RAW clips.
+ * Plain C API of libbluecompress (the Rust core built as a cdylib/staticlib), for build
+ * servers, scripts and bindings in other languages. All paths are UTF-8.
+ * SPDX-License-Identifier: Apache-2.0 */
+#ifndef BLUECOMPRESS_H
+#define BLUECOMPRESS_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+/* Define BC_SHARED_USE when linking the Windows DLL. */
+#if defined(BC_SHARED_USE) && defined(_WIN32)
+#  define BC_API __declspec(dllimport)
+#else
+#  define BC_API
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+enum bc_resolution {
+    BC_RES_ORIGINAL = 0, /* keep the recorded raw resolution */
+    BC_RES_6K = 6,       /* 6048 x 3402 active (6060 x 3410 coded), only from larger sources */
+    BC_RES_4K = 4        /* 3840 x 2160 active UHD (3852 x 2168 coded) */
+};
+
+enum bc_quality {
+    BC_Q1 = 1, /* lossless: camera's coded data repacked, pixel-identical (4 to 10% smaller) */
+    BC_Q2 = 2, /* archival: error below sensor noise (15 to 25% smaller) */
+    BC_Q3 = 3, /* high: shadow noise slightly smoothed (33 to 42% smaller) */
+    BC_Q4 = 4  /* compact: for offline and reference copies (about 57% smaller) */
+};
+
+enum bc_backend {
+    BC_BACKEND_AUTO = 0,
+    BC_BACKEND_CPU = 1,
+    BC_BACKEND_METAL = 2,
+    BC_BACKEND_CUDA = 3
+};
+
+typedef struct bc_clip_info {
+    uint32_t width, height;     /* Bayer size */
+    uint32_t frames;
+    double fps;
+    uint64_t file_bytes;
+    uint64_t video_bytes;
+    char codec[8];              /* "NRAW" (N-RAW) or "NR3D" (R3D NE) */
+    int audio_tracks;
+} bc_clip_info;
+
+typedef struct bc_options {
+    const char* input;
+    const char* output;         /* full output path */
+    int quality;                /* bc_quality */
+    int resolution;             /* bc_resolution */
+    int backend;                /* bc_backend */
+    int threads;                /* 0 = all cores */
+} bc_options;
+
+typedef struct bc_result {
+    uint64_t input_bytes, output_bytes;
+    uint32_t frames;
+    double seconds;
+    double fps;
+    char backend[32];
+    char error[512];
+} bc_result;
+
+/* progress: fraction 0..1, current frames per second. Return nonzero to cancel. */
+typedef int (*bc_progress_fn)(void* user, double fraction, double fps);
+
+BC_API int bc_probe(const char* path, bc_clip_info* info, char* error, size_t error_len);
+
+/* Output resolution for a source and a requested resolution (0 if not applicable). */
+BC_API void bc_output_size(uint32_t src_w, uint32_t src_h, int resolution, uint32_t* out_w, uint32_t* out_h);
+
+/* Runs synchronously; call from a background thread. Returns 0 on success. */
+BC_API int bc_transcode(const bc_options* options, bc_progress_fn progress, void* user, bc_result* result);
+
+/* Names of the available GPU backends, e.g. "Metal (Apple GPU)". */
+BC_API const char* bc_backend_description(int backend);
+
+BC_API const char* bc_version(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

@@ -1,0 +1,120 @@
+name: Release
+
+# Push a tag like v0.1.0 (or run manually) to build installers and command line tools for
+# macOS (Apple silicon and Intel), Windows and Linux and attach them to a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0); it must already exist"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --draft --prerelease \
+            --title "Blue Compressor ${TAG#v}" --notes-file .github/release-notes.md
+
+  build:
+    needs: create-release
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macOS Apple silicon, os: macos-latest, target: aarch64-apple-darwin, arch: arm64 }
+          - { name: macOS Intel, os: macos-latest, target: x86_64-apple-darwin, arch: x64 }
+          - { name: Windows x64, os: windows-latest, target: x86_64-pc-windows-msvc, arch: x64 }
+          - { name: Linux x64, os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, arch: x64 }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - name: Install Tauri CLI
+        uses: taiki-e/install-action@v2
+        with:
+          tool: tauri-cli@2
+
+      - name: Build desktop app
+        working-directory: app/src-tauri
+        shell: bash
+        run: cargo tauri build --target ${{ matrix.target }}
+
+      - name: Build command line tool
+        shell: bash
+        run: |
+          features=""
+          # The untested CUDA backend is included on Windows and Linux; it stays off
+          # unless an NVIDIA driver is present.
+          if [ "${{ runner.os }}" != "macOS" ]; then features="--features cuda"; fi
+          cargo build --release -p bluecompress-cli --target ${{ matrix.target }} $features
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="${TAG#v}"
+          out="$PWD/dist"; mkdir -p "$out"
+          b="target/${{ matrix.target }}/release/bundle"
+          case "${{ runner.os }}" in
+            macOS)
+              cp "$b"/dmg/*.dmg "$out/Blue-Compressor_${v}_macOS_${{ matrix.arch }}.dmg"
+              ;;
+            Windows)
+              cp "$b"/nsis/*.exe "$out/Blue-Compressor_${v}_Windows_${{ matrix.arch }}-setup.exe"
+              cp "$b"/msi/*.msi "$out/Blue-Compressor_${v}_Windows_${{ matrix.arch }}.msi"
+              ;;
+            Linux)
+              cp "$b"/appimage/*.AppImage "$out/Blue-Compressor_${v}_Linux_${{ matrix.arch }}.AppImage"
+              cp "$b"/deb/*.deb "$out/Blue-Compressor_${v}_Linux_${{ matrix.arch }}.deb"
+              cp "$b"/rpm/*.rpm "$out/Blue-Compressor_${v}_Linux_${{ matrix.arch }}.rpm"
+              ;;
+          esac
+          # Command line tool, library and C header.
+          os="${{ runner.os }}"
+          cli="bluecompress-cli_${v}_${os}_${{ matrix.arch }}"
+          mkdir -p "$cli/include"
+          r="target/${{ matrix.target }}/release"
+          cp -R LICENSE NOTICE LICENSES README.md "$cli/"
+          cp crates/core/include/bluecompress.h "$cli/include/"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "$r/bluecompress.exe" "$r/bluecompress.dll" "$r/bluecompress.dll.lib" "$cli/" 2>/dev/null || cp "$r/bluecompress.exe" "$cli/"
+            7z a "$out/$cli.zip" "$cli" >/dev/null
+          else
+            cp "$r/bluecompress" "$cli/"
+            cp "$r"/libbluecompress.{dylib,so,a} "$cli/" 2>/dev/null || true
+            tar czf "$out/$cli.tar.gz" "$cli"
+          fi
+          ls -l "$out"
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: gh release upload "$TAG" dist/* --clobber

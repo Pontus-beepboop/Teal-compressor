@@ -1,0 +1,24 @@
+[package]
+name = "bluecompress"
+description = "Re-encodes Nikon N-RAW (.NEV) and R3D NE (.R3D) TICO RAW clips"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[features]
+default = ["metal"]
+metal = []
+# Untested NVIDIA backend (CUDA driver and NVRTC are loaded at run time; no toolkit needed to build).
+cuda = ["dep:cudarc"]
+
+[dependencies]
+rayon = "1"
+cudarc = { version = "0.19", optional = true, default-features = false, features = ["std", "driver", "nvrtc", "fallback-dynamic-loading", "cuda-12060"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-metal = "0.3"

@@ -1,0 +1,34 @@
+Blue Compressor
+Copyright 2026 The Blue Compressor contributors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Trademarks
+----------
+Nikon, N-RAW, RED, R3D, R3D NE, REDCODE, TICO and TicoRAW are trademarks of their
+respective owners. This project is not affiliated with or endorsed by Nikon, RED Digital
+Cinema or intoPIX; the names are used only to identify the file formats it processes.
+
+Portions derived from rawmakase
+-------------------------------
+The Star-Tetrix lifting steps, the 5/3 wavelet and the transfer curve in
+crates/core/src/frame.rs (and their GPU versions in crates/core/src/gpu/) follow the Nikon
+HE / HE* decoder of rawmakase (https://github.com/pch/rawmakase):
+
+  Copyright (c) 2026 RAWmakase contributors
+  Licensed under the MIT License; the full license text is in LICENSES/rawmakase-MIT.txt.
+
+References
+----------
+The following public works were also consulted and are acknowledged with thanks; no code
+from them is included:
+
+* SVT-JPEG-XS (https://github.com/OpenVisualCloud/SVT-JPEG-XS), Copyright (c) 2024
+  Intel Corporation, BSD-2-Clause-Patent, a reference JPEG XS implementation.
+* ISO/IEC 21122 (JPEG XS).
+
+Third-party dependencies
+------------------------
+Binary builds include Rust crates (Tauri, rayon, objc2, cudarc and their dependencies)
+under their own permissive licenses, mostly MIT and/or Apache-2.0. A full list can be
+generated with `cargo tree` or a tool such as cargo-about.

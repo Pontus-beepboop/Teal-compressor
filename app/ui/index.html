@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Blue Compressor</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app">
+    <header class="titlebar" data-tauri-drag-region>
+      <div class="brand" data-tauri-drag-region>
+        <img src="icon.png" alt="" class="brand-icon" draggable="false">
+        <div class="brand-text" data-tauri-drag-region>
+          <span class="brand-name">Blue Compressor <span class="beta-tag" title="Beta software: keep your originals">Beta</span></span>
+          <span class="brand-sub">Raw video recompression for Nikon N-RAW and R3D NE</span>
+        </div>
+      </div>
+      <div class="titlebar-right" data-tauri-drag-region>
+        <span class="chip" id="engine-chip" title="Processor"><span class="chip-dot"></span><span id="engine-text">Starting</span></span>
+      </div>
+    </header>
+
+    <div class="body">
+      <aside class="panel">
+        <label class="switch-row" id="same-row">
+          <span class="switch-text">
+            <span class="switch-title">Same settings for all clips</span>
+            <span class="switch-sub" id="same-sub">Applies to every clip in the queue</span>
+          </span>
+          <input type="checkbox" id="same-all" class="switch" checked>
+        </label>
+
+        <section class="field">
+          <div class="field-label" id="label-resolution">Resolution</div>
+          <div class="seg" id="seg-resolution" role="radiogroup" aria-label="Resolution">
+            <button data-value="original" role="radio">Original</button>
+            <button data-value="6k" role="radio">6K</button>
+            <button data-value="4k" role="radio">4K UHD</button>
+          </div>
+          <p class="hint" id="resolution-note"></p>
+        </section>
+
+        <section class="field">
+          <div class="field-label" id="label-quality">Quality</div>
+          <div class="seg seg-quality" id="seg-quality" role="radiogroup" aria-label="Quality">
+            <button data-value="1" role="radio"><b>Q1</b><small>Lossless</small></button>
+            <button data-value="2" role="radio"><b>Q2</b><small>Archival</small></button>
+            <button data-value="3" role="radio"><b>Q3</b><small>High</small></button>
+            <button data-value="4" role="radio"><b>Q4</b><small>Compact</small></button>
+          </div>
+          <div class="quality-card">
+            <div class="quality-head">
+              <span class="quality-title" id="quality-title"></span>
+              <span class="quality-saving" id="quality-saving"></span>
+            </div>
+            <p class="quality-text" id="quality-text"></p>
+            <div class="meter" aria-hidden="true">
+              <div class="meter-fill" id="quality-meter"></div>
+            </div>
+            <div class="meter-legend"><span>Original size</span><span id="quality-meter-label"></span></div>
+          </div>
+        </section>
+
+        <section class="field">
+          <div class="field-label">Resizing on</div>
+          <div class="seg" id="seg-backend" role="radiogroup" aria-label="Resizing on">
+            <button data-value="gpu" role="radio">GPU</button>
+            <button data-value="cpu" role="radio">CPU</button>
+          </div>
+          <p class="hint" id="backend-note"></p>
+        </section>
+
+        <section class="field">
+          <div class="field-label">Save to</div>
+          <div class="seg" id="seg-dest" role="radiogroup" aria-label="Save to">
+            <button data-value="next" role="radio">Next to clips</button>
+            <button data-value="custom" role="radio" id="dest-custom">Choose folder</button>
+          </div>
+          <p class="hint dest-hint" id="dest-hint"></p>
+        </section>
+
+        <div class="beta-note">
+          <svg viewBox="0 0 16 16" class="ico-sm"><path d="M8 5.2v3.3m0 2.2v.1M7 2.3 1.6 11.6c-.5.8.1 1.9 1.1 1.9h10.6c1 0 1.6-1.1 1.1-1.9L9 2.3c-.4-.8-1.6-.8-2 0Z"/></svg>
+          <span><b>Beta software.</b> Keep your digital negatives (the original clips) until you have checked the compressed copies yourself.</span>
+        </div>
+      </aside>
+
+      <main class="queue" id="queue">
+        <div class="queue-head">
+          <div class="queue-title">
+            <h2>Queue</h2>
+            <span class="queue-meta" id="queue-meta"></span>
+          </div>
+          <div class="queue-actions">
+            <button class="btn ghost" id="btn-add">
+              <svg viewBox="0 0 16 16" class="ico-sm"><path d="M8 3v10M3 8h10"/></svg>Add Clips
+            </button>
+            <button class="btn ghost" id="btn-add-folder">
+              <svg viewBox="0 0 16 16" class="ico-sm"><path d="M1.8 4.2c0-.7.5-1.2 1.2-1.2h3l1.4 1.6h5.6c.7 0 1.2.5 1.2 1.2v6.2c0 .7-.5 1.2-1.2 1.2H3c-.7 0-1.2-.5-1.2-1.2V4.2Z"/></svg>Add Folder
+            </button>
+            <button class="btn ghost" id="btn-clear">Clear Finished</button>
+          </div>
+        </div>
+
+        <div class="empty" id="empty">
+          <div class="drop-zone" id="drop-zone">
+            <div class="drop-art" aria-hidden="true">
+              <div class="quad">
+                <span class="q g"></span><span class="q r"></span>
+                <span class="q b"></span><span class="q g"></span>
+              </div>
+              <svg viewBox="0 0 24 24" class="drop-arrow"><path d="M12 4v11m0 0-4.5-4.5M12 15l4.5-4.5M5 19h14"/></svg>
+            </div>
+            <div class="drop-title">Drop clips or folders here</div>
+            <div class="drop-sub">Nikon N-RAW <span class="kbd">.NEV</span> and R3D NE <span class="kbd">.R3D</span>, any number at once</div>
+            <div class="drop-buttons">
+              <button class="btn primary-soft" id="empty-add">Choose Clips</button>
+              <button class="btn ghost" id="empty-add-folder">Choose Folder</button>
+            </div>
+            <ul class="promises">
+              <li><svg viewBox="0 0 16 16" class="ico-sm"><path d="M8 1.5 2.5 3.8v3.7c0 3.3 2.3 6 5.5 7 3.2-1 5.5-3.7 5.5-7V3.8L8 1.5Z"/><path d="m5.6 8 1.7 1.7 3.2-3.4"/></svg>Originals are never modified</li>
+              <li><svg viewBox="0 0 16 16" class="ico-sm"><path d="M3 2.5h7l3 3v8H3z"/><path d="M5.5 8h5M5.5 10.5h5"/></svg>Metadata, audio and timecode kept</li>
+              <li><svg viewBox="0 0 16 16" class="ico-sm"><path d="M6.5 9.5 9.5 6.5M7.2 4.3l1-1a2.6 2.6 0 0 1 3.6 3.6l-1 1M8.8 11.7l-1 1a2.6 2.6 0 0 1-3.6-3.6l1-1"/></svg>Same file names, so edits relink</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="list" id="list"></div>
+
+        <div class="drop-overlay" id="drop-overlay">
+          <div class="drop-overlay-inner">
+            <svg viewBox="0 0 24 24" class="drop-arrow"><path d="M12 4v11m0 0-4.5-4.5M12 15l4.5-4.5M5 19h14"/></svg>
+            <span>Drop to add to the queue</span>
+          </div>
+        </div>
+      </main>
+    </div>
+
+    <section class="viewer" id="viewer" aria-label="Quality preview">
+      <div class="viewer-top">
+        <button class="icon-btn v-close" id="v-close" title="Back to queue (Esc)">
+          <svg viewBox="0 0 16 16"><path d="M10 3.5 5.5 8l4.5 4.5"/></svg>
+        </button>
+        <div class="v-title">
+          <div class="v-name" id="v-name"></div>
+          <div class="v-meta" id="v-meta"></div>
+        </div>
+        <div class="v-controls">
+          <div class="v-group"><span class="v-group-label">Quality</span>
+            <div class="seg seg-sm" id="v-quality">
+              <button data-value="1">Q1</button><button data-value="2">Q2</button><button data-value="3">Q3</button><button data-value="4">Q4</button>
+            </div>
+          </div>
+          <div class="v-group"><span class="v-group-label">Resolution</span>
+            <div class="seg seg-sm" id="v-res">
+              <button data-value="original">Original</button><button data-value="6k">6K</button><button data-value="4k">4K</button>
+            </div>
+          </div>
+          <div class="v-group"><span class="v-group-label">Zoom</span>
+            <div class="seg seg-sm" id="v-zoom">
+              <button data-value="fit">Fit</button><button data-value="1">100%</button><button data-value="2">200%</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="stage" id="stage">
+        <canvas id="v-canvas"></canvas>
+        <div class="v-tag left">Original</div>
+        <div class="v-tag right" id="v-tag-after"></div>
+        <div class="v-split" id="v-split"><div class="v-knob"><svg viewBox="0 0 16 16"><path d="M6 4 2.5 8 6 12M10 4l3.5 4-3.5 4"/></svg></div></div>
+        <div class="v-loading" id="v-loading"><span class="spinner"></span><span id="v-loading-text">Rendering</span></div>
+        <div class="v-error" id="v-error"></div>
+        <div class="v-mini" id="v-mini" title="Drag to move around the frame">
+          <canvas id="v-mini-canvas"></canvas>
+          <div class="v-mini-view" id="v-mini-view"></div>
+        </div>
+        <div class="v-zoom-badge" id="v-zoom-badge"></div>
+        <div class="v-hint" id="v-hint">Drag the line to compare. Click to zoom in, pinch or scroll to zoom, drag to pan.</div>
+      </div>
+
+      <div class="viewer-bottom">
+        <div class="scrub">
+          <button class="icon-btn" id="v-prev" title="Previous frame (Left)"><svg viewBox="0 0 16 16"><path d="M10 3.5 5.5 8l4.5 4.5"/></svg></button>
+          <input type="range" id="v-frame" min="0" max="0" value="0" class="range">
+          <button class="icon-btn" id="v-next" title="Next frame (Right)"><svg viewBox="0 0 16 16"><path d="m6 3.5 4.5 4.5L6 12.5"/></svg></button>
+          <div class="scrub-label"><span id="v-frame-label">Frame 1</span><span class="scrub-tc" id="v-tc"></span></div>
+        </div>
+        <div class="v-estimate">
+          <div class="v-est-main" id="v-est-main">Estimating</div>
+          <div class="v-est-sub" id="v-est-sub"></div>
+        </div>
+        <button class="btn primary" id="v-apply">Apply to this clip</button>
+      </div>
+    </section>
+
+    <footer class="bar">
+      <div class="bar-progress" aria-hidden="true"><div class="bar-progress-fill" id="bar-fill"></div></div>
+      <div class="bar-left">
+        <div class="bar-main" id="bar-main">No clips yet</div>
+        <div class="bar-sub" id="bar-sub">Add clips to see the estimated savings</div>
+      </div>
+      <button class="btn primary" id="btn-go" disabled>
+        <svg viewBox="0 0 16 16" class="ico-sm" id="go-icon"><path d="M4.5 3.2v9.6L12.5 8 4.5 3.2Z" class="fill"/></svg>
+        <span id="go-label">Compress</span>
+      </button>
+    </footer>
+  </div>
+
+  <div class="modal" id="quit-modal" role="dialog" aria-modal="true" aria-labelledby="quit-title">
+    <div class="modal-card">
+      <div class="modal-icon">
+        <svg viewBox="0 0 24 24"><path d="M12 8v5m0 3.2v.1M10.3 3.9 2.6 17.3c-.8 1.3.2 2.9 1.7 2.9h15.4c1.5 0 2.5-1.6 1.7-2.9L13.7 3.9c-.8-1.3-2.6-1.3-3.4 0Z"/></svg>
+      </div>
+      <h3 id="quit-title">Stop compressing and quit?</h3>
+      <p>The clip in progress is discarded. Finished clips are kept.</p>
+      <div class="modal-buttons">
+        <button class="btn ghost" id="quit-cancel">Keep Working</button>
+        <button class="btn danger" id="quit-confirm">Stop and Quit</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal" id="beta-modal" role="dialog" aria-modal="true" aria-labelledby="beta-title">
+    <div class="modal-card">
+      <div class="modal-icon">
+        <svg viewBox="0 0 24 24"><path d="M12 8v5m0 3.2v.1M10.3 3.9 2.6 17.3c-.8 1.3.2 2.9 1.7 2.9h15.4c1.5 0 2.5-1.6 1.7-2.9L13.7 3.9c-.8-1.3-2.6-1.3-3.4 0Z"/></svg>
+      </div>
+      <h3 id="beta-title">Blue Compressor is beta software</h3>
+      <p>It has been tested on only a few cameras and clips. Do not delete your digital negatives (the original clips) until you have opened the compressed copies in your own software and checked them yourself.</p>
+      <div class="modal-buttons">
+        <button class="btn primary" id="beta-ok">I understand</button>
+      </div>
+    </div>
+  </div>
+
+  <template id="tpl-job">
+    <div class="job">
+      <div class="job-thumb"><canvas class="job-thumb-img"></canvas><span class="job-codec"></span></div>
+      <div class="job-main">
+        <div class="job-line1">
+          <span class="job-name"></span>
+          <span class="job-pill"></span>
+        </div>
+        <div class="job-meta"></div>
+        <div class="job-settings">
+          <select class="mini-select job-q" title="Quality">
+            <option value="1">Q1 Lossless</option><option value="2">Q2 Archival</option>
+            <option value="3">Q3 High</option><option value="4">Q4 Compact</option>
+          </select>
+          <select class="mini-select job-r" title="Resolution">
+            <option value="original">Original</option><option value="6k">6K</option><option value="4k">4K UHD</option>
+          </select>
+        </div>
+      </div>
+      <div class="job-side">
+        <div class="job-stat"></div>
+        <div class="job-stat-sub"></div>
+      </div>
+      <div class="job-actions">
+        <button class="icon-btn job-preview" title="Preview quality">
+          <svg viewBox="0 0 16 16"><path d="M1.5 8s2.4-4.5 6.5-4.5S14.5 8 14.5 8 12.1 12.5 8 12.5 1.5 8 1.5 8Z"/><circle cx="8" cy="8" r="2"/></svg>
+        </button>
+        <button class="icon-btn job-reveal" title="Show in folder">
+          <svg viewBox="0 0 16 16"><path d="M6.5 3H3.8C3 3 2.5 3.5 2.5 4.3v7.9c0 .8.5 1.3 1.3 1.3h7.9c.8 0 1.3-.5 1.3-1.3V9.5"/><path d="M9 2.5h4.5V7M13.3 2.7 7.5 8.5"/></svg>
+        </button>
+        <button class="icon-btn job-remove" title="Remove from queue">
+          <svg viewBox="0 0 16 16"><path d="m4.5 4.5 7 7m0-7-7 7"/></svg>
+        </button>
+      </div>
+      <div class="job-after">
+        <span class="job-after-info"></span>
+        <button class="link-btn job-again"></button>
+      </div>
+      <div class="job-progress"><div class="job-progress-fill"></div></div>
+    </div>
+  </template>
+
+  <script src="app.js"></script>
+</body>
+</html>

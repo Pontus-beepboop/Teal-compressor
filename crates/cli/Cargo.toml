@@ -1,0 +1,17 @@
+[package]
+name = "bluecompress-cli"
+description = "Headless command line front end for Blue Compressor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "bluecompress"
+path = "src/main.rs"
+
+[dependencies]
+bluecompress = { path = "../core" }
+ctrlc = { version = "3", features = ["termination"] }
+
+[features]
+cuda = ["bluecompress/cuda"]

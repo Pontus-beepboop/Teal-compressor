@@ -1,0 +1,21 @@
+# Build output
+/target/
+/target-*/
+/build*/
+/dist/
+app/src-tauri/gen/
+
+# Camera footage, vendor SDKs and local reference material: never commit these
+/resources/
+*.NEV
+*.nev
+*.R3D
+*.r3d
+*.RDC
+*.partial
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
