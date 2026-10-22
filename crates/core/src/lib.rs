@@ -79,6 +79,8 @@ pub enum Backend {
     Cpu,
     Metal,
     Cuda,
+    /// OpenCL (AMD and other GPUs; `opencl` feature).
+    OpenCl,
 }
 
 #[derive(Debug, Clone)]
@@ -145,6 +147,9 @@ pub fn backend_description(backend: Backend) -> String {
         b => gpu::description(b).unwrap_or_else(|| match b {
             Backend::Metal => "not available (Metal needs macOS)".into(),
             Backend::Cuda => "not available (built without the cuda feature, or no NVIDIA GPU)".into(),
+            Backend::OpenCl => {
+                "not available (built without the opencl feature, or no OpenCL GPU with double precision)".into()
+            }
             _ => format!("CPU only ({} threads)", transcode::hardware_threads()),
         }),
     }

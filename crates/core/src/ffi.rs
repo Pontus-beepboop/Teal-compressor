@@ -79,6 +79,7 @@ fn backend(v: c_int) -> Backend {
         1 => Backend::Cpu,
         2 => Backend::Metal,
         3 => Backend::Cuda,
+        4 => Backend::OpenCl,
         _ => Backend::Auto,
     }
 }

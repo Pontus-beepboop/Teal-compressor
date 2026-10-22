@@ -61,6 +61,7 @@ mod mock {
         match backend {
             Backend::Cpu => "CPU (12 threads)".into(),
             Backend::Cuda => "not available (CUDA backend not built)".into(),
+            Backend::OpenCl => "not available (OpenCL backend not built)".into(),
             _ => "Metal: Apple GPU".into(),
         }
     }

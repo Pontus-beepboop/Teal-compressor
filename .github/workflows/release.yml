@@ -70,9 +70,9 @@ jobs:
         shell: bash
         run: |
           features=""
-          # The untested CUDA backend is included on Windows and Linux; it stays off
-          # unless an NVIDIA driver is present.
-          if [ "${{ runner.os }}" != "macOS" ]; then features="--features cuda"; fi
+          # The untested CUDA and OpenCL (AMD) backends are included on Windows and Linux;
+          # they stay off unless a matching GPU driver is present.
+          if [ "${{ runner.os }}" != "macOS" ]; then features="--features cuda,opencl"; fi
           cargo build --release -p bluecompress-cli --target ${{ matrix.target }} $features
 
       - name: Collect artifacts

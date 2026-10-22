@@ -36,7 +36,8 @@ enum bc_backend {
     BC_BACKEND_AUTO = 0,
     BC_BACKEND_CPU = 1,
     BC_BACKEND_METAL = 2,
-    BC_BACKEND_CUDA = 3
+    BC_BACKEND_CUDA = 3,
+    BC_BACKEND_OPENCL = 4 /* AMD and other OpenCL GPUs */
 };
 
 typedef struct bc_clip_info {
