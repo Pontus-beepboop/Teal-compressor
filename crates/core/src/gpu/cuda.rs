@@ -1,7 +1,8 @@
 //! CUDA backend for the resize pipeline: the same kernels and buffer plan as the Metal
 //! backend, compiled at run time with NVRTC and driven through the CUDA driver API
 //! (both loaded dynamically, so builds need no CUDA toolkit). Entropy coding stays on
-//! the CPU.
+//! the CPU. The kernels are written to give results bit-identical to the CPU path (double
+//! precision transfer curve, no fused multiply-add unless the CPU build fuses too).
 //!
 //! UNTESTED: written without an NVIDIA GPU. Before trusting it, compare against the CPU
 //! path, for example by transcoding the same clip with `-b cuda` and `-b cpu` at 6K and
@@ -10,7 +11,7 @@
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
-use cudarc::nvrtc::compile_ptx;
+use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 
 use crate::frame::{decode_frame, encode_frame, level_widths, Coeffs};
 use crate::quality::{encode_rank_for_quality, Geometry};
@@ -113,7 +114,18 @@ impl CudaResizer {
 
     fn create(src: Geometry, dst: Geometry) -> Option<CudaResizer> {
         let ctx = CudaContext::new(0).ok()?;
-        let ptx = match compile_ptx(SOURCE) {
+        // Match the CPU path bit for bit: no contraction of a*b+c unless the CPU build
+        // fuses it too (see resample::madd), IEEE division and square root, no flush to zero.
+        let fma = cfg!(any(target_arch = "aarch64", target_feature = "fma"));
+        let opts = CompileOptions {
+            fmad: Some(false),
+            ftz: Some(false),
+            prec_div: Some(true),
+            prec_sqrt: Some(true),
+            options: if fma { vec!["-DBC_FMA=1".into()] } else { Vec::new() },
+            ..Default::default()
+        };
+        let ptx = match compile_ptx_with_opts(SOURCE, opts) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("bluecompress: CUDA kernel compile failed: {e:?}");
@@ -205,7 +217,7 @@ impl CudaResizer {
 
     fn resample(&self, c: &mut Context, h: &TicoHeader, ls: &Layout, ld: &Layout) -> Result<()> {
         let (sw, sh, dw, dh) = (ls.cw, ls.ch, ld.cw, ld.ch);
-        let (black, gain, knee) = (h.black as f32, h.gain as f32, h.knee as f32);
+        let (black, gain, knee) = (h.black as f64, h.gain as f64, h.knee as f64);
         // B (int code planes) -> A (float raw planes).
         let n = (4 * sw * sh) as u64;
         let mut b = c.stream.launch_builder(&self.f["to_raw"]);
