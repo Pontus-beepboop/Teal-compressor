@@ -310,3 +310,23 @@ impl Resizer for CudaResizer {
         result
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// NVRTC compiles kernels.cu and every kernel in KERNELS loads. Skipped without a GPU.
+    #[test]
+    fn kernels_compile_and_load() {
+        if !available() {
+            eprintln!("CUDA not available, skipping");
+            return;
+        }
+        let ctx = CudaContext::new(0).expect("CUDA context");
+        let ptx = compile_ptx(SOURCE).expect("NVRTC compile");
+        let module = ctx.load_module(ptx).expect("load module");
+        for &k in KERNELS {
+            module.load_function(k).unwrap_or_else(|e| panic!("load {k}: {e:?}"));
+        }
+    }
+}
