@@ -1,3 +1,10 @@
+**What's new in 0.1.2**
+- Experimental GPU acceleration on Windows and Linux, in both the app and the command line tool: AMD graphics cards through OpenCL and Nvidia graphics cards through CUDA. The GPU is only used when downsizing to 6K or 4K; at the original resolution everything runs on the CPU as before. Without a supported GPU and driver it falls back to the CPU automatically.
+- This is untested on real AMD and Nvidia hardware, so feedback is very welcome. If you have one of these cards:
+  1. Check that the engine label in the app (or `bluecompress backends`) shows your graphics card.
+  2. Compress a clip to 6K or 4K once with GPU and once with CPU at the same quality, and compare the two output files' hashes (they should be identical).
+  3. Report the speed of both runs, and any crashes or errors, with your card and driver version.
+
 **What's new in 0.1.1**
 - Fixed: queue rows no longer get squashed when a large batch of clips is added (for example a few hundred). Rows keep their full height and the list scrolls, so you can remove or change settings for any clip.
 
