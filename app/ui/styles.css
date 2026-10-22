@@ -363,7 +363,7 @@ svg .fill { fill: currentColor; stroke: none; }
 .drop-overlay .drop-arrow { position: static; width: 44px; height: 44px; padding: 10px; }
 
 /* Job list */
-.list { flex: 1; overflow-y: auto; padding: 2px 22px 22px; display: flex; flex-direction: column; gap: 8px; }
+.list { flex: 1; min-height: 0; overflow-y: auto; padding: 2px 22px 22px; display: flex; flex-direction: column; gap: 8px; }
 
 .job {
   position: relative;
@@ -376,6 +376,7 @@ svg .fill { fill: currentColor; stroke: none; }
   background: var(--surface);
   border: 1px solid var(--border);
   overflow: hidden;
+  flex-shrink: 0; /* keep full height in long queues; the list scrolls instead */
   animation: rise 0.2s ease-out both;
   transition: border-color 0.2s, background 0.2s;
 }
