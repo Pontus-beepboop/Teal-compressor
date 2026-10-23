@@ -144,7 +144,7 @@ pub fn backend_description(backend: Backend) -> String {
         Backend::Cpu => format!("CPU ({} threads)", transcode::hardware_threads()),
         b => gpu::description(b).unwrap_or_else(|| match b {
             Backend::Metal => "not available (Metal needs macOS)".into(),
-            Backend::Cuda => "not available (built without the cuda feature, or no NVIDIA GPU)".into(),
+            Backend::Cuda => "not available (needs the cuda feature, an NVIDIA GPU and driver, and NVRTC 12.x)".into(),
             _ => format!("CPU only ({} threads)", transcode::hardware_threads()),
         }),
     }
