@@ -560,6 +560,14 @@ function renderWatch(w) {
   const q = QUALITY[w.quality] ? w.quality : 3;
   const res = w.resolution || "original";
   $("watch-preset").textContent = settingLabel(q, res);
+  if ($("watch-quality")) setSeg("watch-quality", q, null);
+  if ($("watch-resolution")) setSeg("watch-resolution", res, null);
+  if ($("watch-clear")) {
+    $("watch-clear").checked = !!w.clearAfterProcess;
+    $("watch-clear-sub").textContent = w.clearAfterProcess
+      ? "Deletes source clip after compression succeeds"
+      : "Keeps source clips in watch input folder";
+  }
   $("watch-dirs").textContent = `${w.inputDir} → ${w.outputDir}`;
   $("watch-dirs").title = `Input: ${w.inputDir}
 Output: ${w.outputDir}`;
@@ -1170,6 +1178,31 @@ async function init() {
   if (info.web) {
     document.body.classList.add("web");
     if ($("drop-title")) $("drop-title").textContent = "Choose clips or folders on this server";
+    let hasSaved = false;
+    try { hasSaved = !!localStorage.getItem("settings"); } catch { /* ignore */ }
+    if (!hasSaved) {
+      if (QUALITY[info.defaultQuality]) settings.quality = info.defaultQuality;
+      if (RES_LABEL[info.defaultResolution]) settings.resolution = info.defaultResolution;
+    }
+    if ($("watch-clear")) {
+      $("watch-clear").addEventListener("change", (e) => {
+        api.invoke("set_watch_settings", { clearAfterProcess: e.target.checked }).then(renderWatch).catch(() => {});
+      });
+    }
+    if ($("watch-quality")) {
+      $("watch-quality").addEventListener("click", (e) => {
+        const b = e.target.closest("button");
+        if (!b) return;
+        api.invoke("set_watch_settings", { quality: Number(b.dataset.value) }).then(renderWatch).catch(() => {});
+      });
+    }
+    if ($("watch-resolution")) {
+      $("watch-resolution").addEventListener("click", (e) => {
+        const b = e.target.closest("button");
+        if (!b) return;
+        api.invoke("set_watch_settings", { resolution: b.dataset.value }).then(renderWatch).catch(() => {});
+      });
+    }
     if (info.watch) renderWatch(info.watch);
   }
   bindSeg("seg-resolution", "resolution");

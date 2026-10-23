@@ -94,6 +94,26 @@
             <div class="meter watch-meter" id="watch-meter" hidden>
               <div class="meter-fill" id="watch-meter-fill"></div>
             </div>
+            <div class="watch-controls">
+              <div class="seg seg-sm" id="watch-quality" role="radiogroup" aria-label="Watch quality">
+                <button data-value="1" role="radio" title="Q1 Lossless">Q1</button>
+                <button data-value="2" role="radio" title="Q2 Archival">Q2</button>
+                <button data-value="3" role="radio" title="Q3 High">Q3</button>
+                <button data-value="4" role="radio" title="Q4 Compact">Q4</button>
+              </div>
+              <div class="seg seg-sm" id="watch-resolution" role="radiogroup" aria-label="Watch resolution">
+                <button data-value="original" role="radio" title="Original resolution">Orig</button>
+                <button data-value="6k" role="radio" title="6K">6K</button>
+                <button data-value="4k" role="radio" title="4K UHD">4K</button>
+              </div>
+            </div>
+            <label class="switch-row watch-clear-row" id="watch-clear-row">
+              <span class="switch-text">
+                <span class="switch-title">Clear watch folder after process</span>
+                <span class="switch-sub" id="watch-clear-sub">Keeps source clips in watch input folder</span>
+              </span>
+              <input type="checkbox" id="watch-clear" class="switch">
+            </label>
           </div>
         </section>
 

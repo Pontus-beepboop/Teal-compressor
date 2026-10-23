@@ -14,8 +14,10 @@ use std::time::{Duration, Instant};
 use bluecompress::{Backend, Codec, Options, Resolution};
 use serde::{Deserialize, Serialize};
 
-use crate::watch::{is_ignored_name, run_watch, WatchConfig, WatchSnapshot};
-use crate::{is_clip, ps};
+use crate::watch::{
+    is_ignored_name, load_persisted_settings, run_watch, save_persisted_settings, WatchConfig, WatchSnapshot,
+};
+use crate::{is_clip, parse_resolution, ps, resolution_name};
 
 const INDEX_HTML: &str = include_str!("../../../app/ui/index.html");
 const STYLES_CSS: &str = include_str!("../../../app/ui/styles.css");
@@ -26,6 +28,8 @@ pub struct ServeConfig {
     pub listen: String,
     pub browse_root: PathBuf,
     pub initial_paths: Vec<String>,
+    pub default_quality: u8,
+    pub default_resolution: Resolution,
     pub default_backend: Backend,
     pub threads: usize,
     pub watch: Option<WatchConfig>,
@@ -33,6 +37,8 @@ pub struct ServeConfig {
 
 struct ServerState {
     browse_root: PathBuf,
+    default_quality: u8,
+    default_resolution: Resolution,
     default_backend: Backend,
     threads: usize,
     running: Arc<AtomicBool>,
@@ -67,7 +73,17 @@ struct AppInfo {
     platform: String,
     web: bool,
     browse_root: String,
+    default_quality: u8,
+    default_resolution: String,
     watch: WatchSnapshot,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetWatchSettingsArgs {
+    clear_after_process: Option<bool>,
+    quality: Option<u8>,
+    resolution: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -522,12 +538,52 @@ fn invoke_command(state: &Arc<ServerState>, cmd: &str, body: &[u8]) -> HttpRespo
                 platform: std::env::consts::OS.into(),
                 web: true,
                 browse_root: ps(&state.browse_root),
+                default_quality: state.default_quality,
+                default_resolution: resolution_name(state.default_resolution).into(),
                 watch: state.watch_state.lock().unwrap().clone(),
             };
             HttpResponse::json(200, &info)
         }
         "watch_status" => {
             let snap = state.watch_state.lock().unwrap().clone();
+            HttpResponse::json(200, &snap)
+        }
+        "set_watch_settings" => {
+            let args: SetWatchSettingsArgs = match serde_json::from_slice(body) {
+                Ok(a) => a,
+                Err(e) => return HttpResponse::text(400, &format!("invalid set_watch_settings args: {e}")),
+            };
+            let snap = {
+                let mut ws = state.watch_state.lock().unwrap();
+                if let Some(c) = args.clear_after_process {
+                    ws.clear_after_process = c;
+                }
+                if let Some(q) = args.quality {
+                    ws.quality = q.clamp(1, 4);
+                }
+                if let Some(r) = args.resolution.as_deref().and_then(parse_resolution) {
+                    ws.resolution = resolution_name(r).into();
+                }
+                if ws.enabled {
+                    let out_dir = PathBuf::from(&ws.output_dir);
+                    let qv = ws.quality;
+                    let rv = ws.resolution.clone();
+                    let cv = ws.clear_after_process;
+                    save_persisted_settings(&out_dir, |p| {
+                        if args.quality.is_some() {
+                            p.quality = Some(qv);
+                        }
+                        if args.resolution.is_some() {
+                            p.resolution = Some(rv);
+                        }
+                        if args.clear_after_process.is_some() {
+                            p.clear_after_process = Some(cv);
+                        }
+                    });
+                }
+                ws.clone()
+            };
+            broadcast_event(&state.sse_clients, "watch-status", &snap);
             HttpResponse::json(200, &snap)
         }
         "is_running" => HttpResponse::json(200, &state.running.load(Ordering::SeqCst)),
@@ -821,8 +877,31 @@ pub fn run_serve(cfg: ServeConfig, cancel: &'static AtomicBool) -> u8 {
     };
 
     let _ = std::fs::create_dir_all(&cfg.browse_root);
+    let initial_watch = match &cfg.watch {
+        Some(wcfg) => {
+            let persisted = load_persisted_settings(&wcfg.output_dir);
+            let qv = persisted.quality.filter(|q| (1..=4).contains(q)).unwrap_or(wcfg.quality);
+            let rv = persisted.resolution.as_deref().and_then(parse_resolution).unwrap_or(wcfg.resolution);
+            let cv = persisted.clear_after_process.unwrap_or(wcfg.clear_after_process);
+            WatchSnapshot {
+                enabled: true,
+                input_dir: ps(&wcfg.input_dir),
+                output_dir: ps(&wcfg.output_dir),
+                quality: qv,
+                resolution: resolution_name(rv).into(),
+                poll_seconds: wcfg.poll_seconds,
+                clear_after_process: cv,
+                state: "idle".into(),
+                ..Default::default()
+            }
+        }
+        None => WatchSnapshot::default(),
+    };
+
     let state = Arc::new(ServerState {
         browse_root: cfg.browse_root,
+        default_quality: cfg.default_quality,
+        default_resolution: cfg.default_resolution,
         default_backend: cfg.default_backend,
         threads: cfg.threads,
         running: Arc::new(AtomicBool::new(false)),
@@ -830,7 +909,7 @@ pub fn run_serve(cfg: ServeConfig, cancel: &'static AtomicBool) -> u8 {
         worker: Mutex::new(None),
         initial: Mutex::new(cfg.initial_paths),
         sse_clients: Arc::new(Mutex::new(Vec::new())),
-        watch_state: Arc::new(Mutex::new(WatchSnapshot::default())),
+        watch_state: Arc::new(Mutex::new(initial_watch)),
         transcode_lock: Arc::new(Mutex::new(())),
     });
 

@@ -66,7 +66,7 @@ fn parse_quality(s: &str) -> Option<u8> {
     }
 }
 
-fn parse_resolution(s: &str) -> Option<Resolution> {
+pub(crate) fn parse_resolution(s: &str) -> Option<Resolution> {
     match s.trim().to_ascii_lowercase().as_str() {
         "original" | "orig" => Some(Resolution::Original),
         "6k" => Some(Resolution::K6),
@@ -82,6 +82,14 @@ fn parse_backend(s: &str) -> Option<Backend> {
         "metal" => Some(Backend::Metal),
         "cuda" => Some(Backend::Cuda),
         "opencl" => Some(Backend::OpenCl),
+        _ => None,
+    }
+}
+
+fn parse_bool(s: &str) -> Option<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
         _ => None,
     }
 }
@@ -104,6 +112,7 @@ struct Cli {
     listen: Option<String>,
     browse_root: Option<String>,
     poll_seconds: Option<u64>,
+    clear_watch: Option<bool>,
     suffix: String,
     json: bool,
     quiet: bool,
@@ -147,6 +156,7 @@ serve and watch options:
                           watch input folder (default: WATCH_INPUT or /watch/in)
       --watch-output DIR  watch output folder (default: WATCH_OUTPUT or /watch/out)
       --poll-seconds N    watch poll interval in seconds (default: WATCH_POLL_SECONDS or 5)
+      --clear-watch       delete source clip in watch input folder after compression succeeds
       --once              watch: run one scan pass on stable files and exit
 
 Folders are searched recursively for .nev and .r3d files. Originals are never modified;
@@ -513,6 +523,14 @@ fn env_watch_poll(cli_p: Option<u64>) -> u64 {
     cli_p.or_else(|| env_nonempty("WATCH_POLL_SECONDS").and_then(|v| v.parse().ok())).unwrap_or(5)
 }
 
+fn env_watch_clear(cli_c: Option<bool>) -> bool {
+    cli_c
+        .or_else(|| env_nonempty("WATCH_CLEAR").and_then(|v| parse_bool(&v)))
+        .or_else(|| env_nonempty("CLEAR_WATCH").and_then(|v| parse_bool(&v)))
+        .or_else(|| env_nonempty("WATCH_DELETE_SOURCE").and_then(|v| parse_bool(&v)))
+        .unwrap_or(false)
+}
+
 fn watch_cmd(o: &Cli) -> u8 {
     let input = o
         .watch_input
@@ -541,6 +559,7 @@ fn watch_cmd(o: &Cli) -> u8 {
         backend: env_watch_backend(o.backend),
         threads: o.threads,
         poll_seconds: env_watch_poll(o.poll_seconds),
+        clear_after_process: env_watch_clear(o.clear_watch),
         json: o.json,
         quiet: o.quiet,
         once: o.once,
@@ -601,6 +620,7 @@ fn serve_cmd(o: &Cli) -> u8 {
             backend: env_watch_backend(o.backend),
             threads: o.threads,
             poll_seconds: env_watch_poll(o.poll_seconds),
+            clear_after_process: env_watch_clear(o.clear_watch),
             json: o.json,
             quiet: o.quiet,
             once: false,
@@ -614,6 +634,7 @@ fn serve_cmd(o: &Cli) -> u8 {
             backend: env_watch_backend(o.backend),
             threads: o.threads,
             poll_seconds: env_watch_poll(o.poll_seconds),
+            clear_after_process: env_watch_clear(o.clear_watch),
             json: o.json,
             quiet: o.quiet,
             once: false,
@@ -622,10 +643,18 @@ fn serve_cmd(o: &Cli) -> u8 {
         None
     };
 
+    let default_quality = o.quality.or_else(|| env_nonempty("QUALITY").and_then(|v| parse_quality(&v))).unwrap_or(2);
+    let default_resolution = o
+        .resolution
+        .or_else(|| env_nonempty("RESOLUTION").and_then(|v| parse_resolution(&v)))
+        .unwrap_or(Resolution::Original);
+
     let cfg = serve::ServeConfig {
         listen,
         browse_root,
         initial_paths: o.inputs.clone(),
+        default_quality,
+        default_resolution,
         default_backend: env_watch_backend(o.backend),
         threads: o.threads,
         watch: watch_cfg,
@@ -654,6 +683,7 @@ fn main() -> ExitCode {
         listen: None,
         browse_root: None,
         poll_seconds: None,
+        clear_watch: None,
         suffix: String::new(),
         json: false,
         quiet: false,
@@ -733,6 +763,8 @@ fn main() -> ExitCode {
                 Some(v) => o.poll_seconds = Some(v),
                 None => return bad("--poll-seconds must be a number"),
             },
+            "--clear-watch" | "--delete-source" => o.clear_watch = Some(true),
+            "--no-clear-watch" | "--keep-source" => o.clear_watch = Some(false),
             "--once" => o.once = true,
             "--suffix" => match it.next() {
                 Some(v) => o.suffix = v,
@@ -971,7 +1003,7 @@ mod tests {
         let bad_path = watch_in.join("CORRUPT.NEV");
         std::fs::write(&bad_path, b"not a valid nev clip").unwrap();
 
-        // 1. Test watch --once (with 1s stability check).
+        // 1. Test watch --once (with 1s stability check and clear_after_process = true).
         let state = Arc::new(Mutex::new(watch::WatchSnapshot::default()));
         let cancel = AtomicBool::new(false);
         let rc = watch::run_watch(
@@ -983,6 +1015,7 @@ mod tests {
                 backend: Backend::Cpu,
                 threads: 2,
                 poll_seconds: 1,
+                clear_after_process: true,
                 json: false,
                 quiet: true,
                 once: true,
@@ -996,11 +1029,16 @@ mod tests {
         assert_eq!(rc, 1);
         let expected_out = watch_out.join("Day1").join("A001").join("CLIP_0001.NEV");
         assert!(expected_out.is_file(), "watch output clip should exist at relative path");
+        assert!(!clip_path.exists(), "source clip should be deleted when clear_after_process is true");
+        assert!(!sub_in.exists(), "empty parent subfolder should be cleaned up after source deletion");
+        assert!(watch_in.is_dir(), "watch_in root folder itself must never be removed");
+        assert!(bad_path.is_file(), "failed corrupt clip must not be deleted");
         let probed = bluecompress::probe(&expected_out).unwrap();
         assert_eq!((probed.width, probed.height, probed.frames), (128, 64, 2));
         let snap = state.lock().unwrap().clone();
         assert_eq!(snap.done_count, 1);
         assert_eq!(snap.failed_count, 1);
+        assert!(snap.clear_after_process);
 
         // 2. Test HTTP + SSE endpoints via serve.rs handler directly on an ephemeral port.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1016,9 +1054,23 @@ mod tests {
             listen: addr.to_string(),
             browse_root: base.clone(),
             initial_paths: vec![],
+            default_quality: 2,
+            default_resolution: Resolution::Original,
             default_backend: Backend::Cpu,
             threads: 2,
-            watch: None,
+            watch: Some(watch::WatchConfig {
+                input_dir: watch_in.clone(),
+                output_dir: watch_out.clone(),
+                quality: 3,
+                resolution: Resolution::Original,
+                backend: Backend::Cpu,
+                threads: 2,
+                poll_seconds: 60,
+                clear_after_process: false,
+                json: false,
+                quiet: true,
+                once: false,
+            }),
         };
         std::thread::spawn(move || {
             serve::run_serve(serve_cfg, &CANCEL);
@@ -1048,6 +1100,21 @@ mod tests {
         assert_eq!(st, 200);
         let info_val: serde_json::Value = serde_json::from_slice(&info_bytes).unwrap();
         assert_eq!(info_val["web"], serde_json::Value::Bool(true));
+        assert_eq!(info_val["defaultQuality"], 2);
+        assert_eq!(info_val["watch"]["clearAfterProcess"], serde_json::Value::Bool(false));
+
+        let set_watch_body =
+            serde_json::json!({ "clearAfterProcess": true, "quality": 2, "resolution": "6k" }).to_string();
+        let (st, sw_bytes) = http_req("POST", "/api/invoke/set_watch_settings", &set_watch_body);
+        assert_eq!(st, 200);
+        let sw_val: serde_json::Value = serde_json::from_slice(&sw_bytes).unwrap();
+        assert_eq!(sw_val["clearAfterProcess"], serde_json::Value::Bool(true));
+        assert_eq!(sw_val["quality"], 2);
+        assert_eq!(sw_val["resolution"], "6k");
+        let persisted = watch::load_persisted_settings(&watch_out);
+        assert_eq!(persisted.clear_after_process, Some(true));
+        assert_eq!(persisted.quality, Some(2));
+        assert_eq!(persisted.resolution.as_deref(), Some("6k"));
 
         let (st, list_bytes) = http_req("GET", &format!("/api/fs/list?path={}", media_dir.display()), "");
         assert_eq!(st, 200);

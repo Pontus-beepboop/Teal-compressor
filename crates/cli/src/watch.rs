@@ -9,9 +9,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use bluecompress::{Backend, Options, Resolution};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use crate::{codec_name, fourcc, is_clip, ps, q, resolution_name};
+use crate::{codec_name, fourcc, is_clip, parse_resolution, ps, q, resolution_name};
+
+const SETTINGS_FILE: &str = ".bluecompress-watch.json";
 
 pub struct WatchConfig {
     pub input_dir: PathBuf,
@@ -21,9 +23,18 @@ pub struct WatchConfig {
     pub backend: Backend,
     pub threads: usize,
     pub poll_seconds: u64,
+    pub clear_after_process: bool,
     pub json: bool,
     pub quiet: bool,
     pub once: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedWatchSettings {
+    pub quality: Option<u8>,
+    pub resolution: Option<String>,
+    pub clear_after_process: Option<bool>,
 }
 
 #[derive(Serialize, Clone, Default)]
@@ -35,6 +46,7 @@ pub struct WatchSnapshot {
     pub quality: u8,
     pub resolution: String,
     pub poll_seconds: u64,
+    pub clear_after_process: bool,
     pub state: String,
     pub current_clip: Option<String>,
     pub fraction: f64,
@@ -60,6 +72,22 @@ pub fn is_ignored_name(name: &str) -> bool {
         || name.ends_with(".tmp")
 }
 
+pub fn load_persisted_settings(output_dir: &Path) -> PersistedWatchSettings {
+    let path = output_dir.join(SETTINGS_FILE);
+    std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+pub fn save_persisted_settings(output_dir: &Path, update: impl FnOnce(&mut PersistedWatchSettings)) {
+    if output_dir.as_os_str().is_empty() {
+        return;
+    }
+    let mut current = load_persisted_settings(output_dir);
+    update(&mut current);
+    if let Ok(bytes) = serde_json::to_vec(&current) {
+        let _ = std::fs::write(output_dir.join(SETTINGS_FILE), bytes);
+    }
+}
+
 fn same_dir(a: &Path, b: &Path) -> bool {
     if a == b {
         return true;
@@ -67,6 +95,19 @@ fn same_dir(a: &Path, b: &Path) -> bool {
     match (a.canonicalize(), b.canonicalize()) {
         (Ok(x), Ok(y)) => x == y,
         _ => false,
+    }
+}
+
+fn cleanup_empty_parent_dirs(file_path: &Path, root_dir: &Path) {
+    let mut cur = file_path.parent();
+    while let Some(dir) = cur {
+        if dir.as_os_str().is_empty() || same_dir(dir, root_dir) || !dir.starts_with(root_dir) {
+            break;
+        }
+        if std::fs::remove_dir(dir).is_err() {
+            break;
+        }
+        cur = dir.parent();
     }
 }
 
@@ -129,30 +170,37 @@ pub fn run_watch(
         return 2;
     }
 
+    let persisted = load_persisted_settings(&cfg.output_dir);
+    let init_quality = persisted.quality.filter(|q| (1..=4).contains(q)).unwrap_or(cfg.quality);
+    let init_resolution = persisted.resolution.as_deref().and_then(parse_resolution).unwrap_or(cfg.resolution);
+    let init_clear = persisted.clear_after_process.unwrap_or(cfg.clear_after_process);
+
     update_state(&state, hook.as_ref(), |s| {
         s.enabled = true;
         s.input_dir = ps(&cfg.input_dir);
         s.output_dir = ps(&cfg.output_dir);
-        s.quality = cfg.quality;
-        s.resolution = resolution_name(cfg.resolution).into();
+        s.quality = init_quality;
+        s.resolution = resolution_name(init_resolution).into();
         s.poll_seconds = cfg.poll_seconds;
+        s.clear_after_process = init_clear;
         s.state = "idle".into();
     });
 
     if !cfg.quiet && !cfg.json {
         println!(
-            "[watch] watching {} -> {} (Q{}, {}, poll {}s)",
+            "[watch] watching {} -> {} (Q{}, {}, poll {}s, clear source: {})",
             cfg.input_dir.display(),
             cfg.output_dir.display(),
-            cfg.quality,
-            resolution_name(cfg.resolution),
-            cfg.poll_seconds
+            init_quality,
+            resolution_name(init_resolution),
+            cfg.poll_seconds,
+            if init_clear { "on" } else { "off" }
         );
         let _ = std::io::stdout().flush();
     }
 
     let mut observed: HashMap<PathBuf, FileStamp> = HashMap::new();
-    let mut processed: HashSet<(PathBuf, u64, Option<SystemTime>)> = HashSet::new();
+    let mut failed_clips: HashSet<(PathBuf, u64, Option<SystemTime>)> = HashSet::new();
     let mut failed_total = 0usize;
 
     loop {
@@ -184,7 +232,7 @@ pub fn run_watch(
             }
             let Some(stamp) = file_stamp(&clip) else { continue };
             let key = (clip.clone(), stamp.0, stamp.1);
-            if processed.contains(&key) {
+            if failed_clips.contains(&key) {
                 continue;
             }
             match observed.get(&clip) {
@@ -228,7 +276,6 @@ pub fn run_watch(
                 }
                 if std::fs::metadata(&target_out).map(|m| m.len() > 0).unwrap_or(false) {
                     observed.remove(&clip);
-                    processed.insert((clip, expected_stamp.0, expected_stamp.1));
                     continue;
                 }
 
@@ -239,7 +286,7 @@ pub fn run_watch(
                 if let Some(parent) = target_out.parent().filter(|p| !p.as_os_str().is_empty()) {
                     if let Err(e) = std::fs::create_dir_all(parent) {
                         failed_total += 1;
-                        processed.insert((clip.clone(), expected_stamp.0, expected_stamp.1));
+                        failed_clips.insert((clip.clone(), expected_stamp.0, expected_stamp.1));
                         observed.remove(&clip);
                         let msg = format!("cannot create {}: {e}", parent.display());
                         update_state(&state, hook.as_ref(), |s| {
@@ -265,6 +312,13 @@ pub fn run_watch(
                     break;
                 }
 
+                let (live_quality, live_resolution) = {
+                    let s = state.lock().unwrap();
+                    let qv = s.quality.clamp(1, 4);
+                    let rv = parse_resolution(&s.resolution).unwrap_or(cfg.resolution);
+                    (qv, rv)
+                };
+
                 update_state(&state, hook.as_ref(), |s| {
                     s.state = "running".into();
                     s.current_clip = Some(rel_s.clone());
@@ -273,7 +327,7 @@ pub fn run_watch(
                 });
 
                 if let Ok(info) = bluecompress::probe(&clip) {
-                    let (ow, oh) = bluecompress::output_size(info.width, info.height, cfg.resolution);
+                    let (ow, oh) = bluecompress::output_size(info.width, info.height, live_resolution);
                     if cfg.json {
                         println!(
                             "{{\"event\":\"start\",\"input\":{},\"output\":{},\"codec\":{},\"width\":{},\"height\":{},\
@@ -284,7 +338,7 @@ pub fn run_watch(
                             info.width,
                             info.height,
                             info.frames,
-                            cfg.quality
+                            live_quality
                         );
                     } else if !cfg.quiet {
                         println!(
@@ -294,7 +348,7 @@ pub fn run_watch(
                             info.height,
                             info.frames,
                             info.fps,
-                            cfg.quality
+                            live_quality
                         );
                     }
                     let _ = std::io::stdout().flush();
@@ -303,8 +357,8 @@ pub fn run_watch(
                 let opt = Options {
                     input: clip.clone(),
                     output: tmp_out.clone(),
-                    quality: cfg.quality,
-                    resolution: cfg.resolution,
+                    quality: live_quality,
+                    resolution: live_resolution,
                     backend: cfg.backend,
                     threads: cfg.threads,
                 };
@@ -327,7 +381,7 @@ pub fn run_watch(
                         if let Err(e) = std::fs::rename(&tmp_out, &target_out) {
                             let _ = std::fs::remove_file(&tmp_out);
                             failed_total += 1;
-                            processed.insert((clip, expected_stamp.0, expected_stamp.1));
+                            failed_clips.insert((clip, expected_stamp.0, expected_stamp.1));
                             let msg = format!("rename failed {}: {e}", target_out.display());
                             update_state(&state, hook.as_ref(), |s| {
                                 s.failed_count += 1;
@@ -344,7 +398,23 @@ pub fn run_watch(
                             }
                             continue;
                         }
-                        processed.insert((clip, expected_stamp.0, expected_stamp.1));
+
+                        let out_ok =
+                            std::fs::metadata(&target_out).map(|m| m.is_file() && m.len() > 0).unwrap_or(false);
+                        let clear_now = state.lock().unwrap().clear_after_process;
+                        let mut cleared = false;
+                        if out_ok && clear_now {
+                            match std::fs::remove_file(&clip) {
+                                Ok(()) => {
+                                    cleared = true;
+                                    cleanup_empty_parent_dirs(&clip, &cfg.input_dir);
+                                }
+                                Err(e) => {
+                                    eprintln!("[watch] {rel_s}: could not remove source file: {e}");
+                                }
+                            }
+                        }
+
                         let saved = 100.0 * (1.0 - r.output_bytes as f64 / r.input_bytes.max(1) as f64);
                         update_state(&state, hook.as_ref(), |s| {
                             s.done_count += 1;
@@ -360,7 +430,8 @@ pub fn run_watch(
                         if cfg.json {
                             println!(
                                 "{{\"event\":\"done\",\"input\":{},\"output\":{},\"input_bytes\":{},\"output_bytes\":{},\
-                                 \"saved_percent\":{saved:.2},\"frames\":{},\"seconds\":{:.3},\"fps\":{:.2},\"backend\":{}}}",
+                                 \"saved_percent\":{saved:.2},\"frames\":{},\"seconds\":{:.3},\"fps\":{:.2},\"backend\":{},\
+                                 \"source_cleared\":{cleared}}}",
                                 q(&ins),
                                 q(&outs),
                                 r.input_bytes,
@@ -371,8 +442,9 @@ pub fn run_watch(
                                 q(&r.backend)
                             );
                         } else if !cfg.quiet {
+                            let clear_note = if cleared { " (source cleared)" } else { "" };
                             println!(
-                                "[watch] done {rel_s}: {:.2} GB -> {:.2} GB ({saved:.1}% smaller) in {:.1} s, {:.1} fps [{}]",
+                                "[watch] done {rel_s}: {:.2} GB -> {:.2} GB ({saved:.1}% smaller) in {:.1} s, {:.1} fps [{}]{clear_note}",
                                 r.input_bytes as f64 / 1e9,
                                 r.output_bytes as f64 / 1e9,
                                 r.seconds,
@@ -388,7 +460,7 @@ pub fn run_watch(
                             break;
                         }
                         failed_total += 1;
-                        processed.insert((clip, expected_stamp.0, expected_stamp.1));
+                        failed_clips.insert((clip, expected_stamp.0, expected_stamp.1));
                         update_state(&state, hook.as_ref(), |s| {
                             s.failed_count += 1;
                             s.last_error = Some(format!("{rel_s}: {}", e.0));

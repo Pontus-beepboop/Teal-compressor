@@ -136,7 +136,7 @@ bluecompress compress -q 3 -r 6k clip.NEV --output clip_6k.NEV
 # Machine-readable progress for build servers (one JSON object per line)
 bluecompress compress --json --skip-existing footage/ -o out/
 
-# Watch a folder for incoming clips and write compressed copies to another folder
+# Watch a folder for incoming clips (add --clear-watch to remove sources after compression)
 bluecompress watch --input /watch/in --output /watch/out -q 3 -r original
 
 # Start the Web UI server (port 9847 by default) with optional background watch folder
@@ -170,9 +170,9 @@ docker run -d \
   --name blue-compressor \
   --restart unless-stopped \
   -p 9847:9847 \
-  -v /volume1/video:/media \
-  -v /volume1/video/watch-in:/watch/in \
-  -v /volume1/video/watch-out:/watch/out \
+  -v /path/to/your/media:/media \
+  -v /path/to/your/watch-in:/watch/in \
+  -v /path/to/your/watch-out:/watch/out \
   -e WATCH_QUALITY=3 \
   -e WATCH_RESOLUTION=original \
   ghcr.io/redn3/blue-compressor:latest
@@ -198,16 +198,21 @@ services:
       - WATCH_ENABLED=true
       - WATCH_INPUT=/watch/in
       - WATCH_OUTPUT=/watch/out
+      - QUALITY=2
+      - RESOLUTION=original
       - WATCH_QUALITY=3
       - WATCH_RESOLUTION=original
       - WATCH_POLL_SECONDS=5
+      - WATCH_CLEAR=false
     volumes:
-      - /volume1/video:/media
-      - /volume1/video/watch-in:/watch/in
-      - /volume1/video/watch-out:/watch/out
+      # Replace the left side of each mapping with existing folders on your NAS or host
+      # (for example /volume1/video:/media on Synology):
+      - /path/to/your/media:/media
+      - /path/to/your/watch-in:/watch/in
+      - /path/to/your/watch-out:/watch/out
 ```
 
-On Synology DSM, open **Container Manager** > **Project** > **Create**, paste the `docker-compose.yml` above (adjusting `/volume1/video` to match your shared folder), and build.
+> **Note:** Replace `/path/to/your/...` on the left side of each volume mapping with real folders that already exist on your NAS or host (or remove the `/watch/in` and `/watch/out` lines if you only want the Web UI). On Synology DSM, **Container Manager** refuses to start a project if any mapped host folder does not exist yet, so create those folders in **File Station** first, then open **Container Manager** > **Project** > **Create**, paste the `docker-compose.yml` above with your paths, and build.
 
 ### Environment variables
 
@@ -218,9 +223,12 @@ On Synology DSM, open **Container Manager** > **Project** > **Create**, paste th
 | `WATCH_ENABLED` | `true` | Set to `false` or `0` to disable the background watch-folder loop. |
 | `WATCH_INPUT` | `/watch/in` | Folder watched recursively for incoming `.NEV` and `.R3D` clips. |
 | `WATCH_OUTPUT` | `/watch/out` | Destination folder for watch-folder outputs (relative paths kept). |
-| `WATCH_QUALITY` | `3` | Quality preset for watch-folder jobs: `1` (`lossless`), `2` (`archival`), `3` (`high`), or `4` (`compact`). |
-| `WATCH_RESOLUTION` | `original` | Output resolution for watch-folder jobs: `original`, `6k`, or `4k`. |
+| `QUALITY` | `2` | Default quality preset (`1`..`4`) for the Web UI (and fallback for `WATCH_QUALITY`). |
+| `RESOLUTION` | `original` | Default resolution (`original`, `6k`, `4k`) for the Web UI (and fallback for `WATCH_RESOLUTION`). |
+| `WATCH_QUALITY` | `3` | Quality preset for watch-folder jobs (`1`..`4`), also adjustable live in the Web UI. |
+| `WATCH_RESOLUTION` | `original` | Output resolution for watch-folder jobs (`original`, `6k`, `4k`), also adjustable live in the Web UI. |
 | `WATCH_POLL_SECONDS` | `5` | Seconds between watch-folder scans and file-copy stability checks. |
+| `WATCH_CLEAR` | `false` | Set to `true` (or toggle **Clear watch folder after process** in the Web UI) to delete source clips from `WATCH_INPUT` once compression succeeds. |
 
 ### One-off CLI runs with Docker
 
