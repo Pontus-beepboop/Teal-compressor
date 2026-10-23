@@ -13,9 +13,13 @@ default = ["metal"]
 metal = []
 # Untested NVIDIA backend (CUDA driver and NVRTC are loaded at run time; no toolkit needed to build).
 cuda = ["dep:cudarc"]
+# OpenCL backend for AMD (and other) GPUs. libOpenCL / OpenCL.dll is loaded at run time, so
+# builds need no SDK and machines without a driver fall back to the CPU.
+opencl = ["dep:opencl3"]
 
 [dependencies]
 rayon = "1"
+opencl3 = { version = "0.12", optional = true, default-features = false, features = ["dynamic"] }
 cudarc = { version = "0.19", optional = true, default-features = false, features = ["std", "driver", "nvrtc", "fallback-dynamic-loading", "cuda-12060"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

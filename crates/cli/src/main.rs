@@ -73,7 +73,7 @@ options:
   -q, --quality 1..4      1 lossless repack (pixel-identical), 2 archival (default),
                           3 high, 4 compact
   -r, --resolution R      original (default), 6k or 4k
-  -b, --backend B         auto (default), cpu, metal or cuda; --cpu / --gpu also work
+  -b, --backend B         auto (default), cpu, metal, cuda or opencl; --cpu / --gpu also work
   -j, --threads N         worker threads (default: all cores)
   -o, --output-dir DIR    write outputs here with the source file names
       --output FILE       single input: exact output path
@@ -206,7 +206,13 @@ fn probe_cmd(o: &Cli) -> u8 {
 }
 
 fn backends_cmd(o: &Cli) -> u8 {
-    let all = [("auto", Backend::Auto), ("cpu", Backend::Cpu), ("metal", Backend::Metal), ("cuda", Backend::Cuda)];
+    let all = [
+        ("auto", Backend::Auto),
+        ("cpu", Backend::Cpu),
+        ("metal", Backend::Metal),
+        ("cuda", Backend::Cuda),
+        ("opencl", Backend::OpenCl),
+    ];
     if o.json {
         let items: Vec<String> =
             all.iter().map(|(n, b)| format!("{}:{}", q(n), q(&bluecompress::backend_description(*b)))).collect();
@@ -474,6 +480,7 @@ fn main() -> ExitCode {
                     "cpu" => Backend::Cpu,
                     "metal" => Backend::Metal,
                     "cuda" => Backend::Cuda,
+                    "opencl" => Backend::OpenCl,
                     _ => return bad("backend must be auto, cpu, metal or cuda"),
                 }
             }

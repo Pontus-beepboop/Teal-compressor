@@ -10,6 +10,9 @@ pub mod metal;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 
+#[cfg(feature = "opencl")]
+pub mod opencl;
+
 pub fn create(backend: Backend, src: Geometry, dst: Geometry) -> Option<Box<dyn Resizer>> {
     #[cfg(all(target_os = "macos", feature = "metal"))]
     if matches!(backend, Backend::Auto | Backend::Metal) {
@@ -20,6 +23,13 @@ pub fn create(backend: Backend, src: Geometry, dst: Geometry) -> Option<Box<dyn 
     #[cfg(feature = "cuda")]
     if matches!(backend, Backend::Auto | Backend::Cuda) {
         if let Some(r) = cuda::CudaResizer::new(src, dst) {
+            return Some(Box::new(r));
+        }
+    }
+    #[cfg(feature = "opencl")]
+    if matches!(backend, Backend::Auto | Backend::OpenCl) {
+        let pick = if backend == Backend::OpenCl { opencl::Pick::AnyGpu } else { opencl::Pick::Auto };
+        if let Some(r) = opencl::OpenClResizer::with_devices(src, dst, pick) {
             return Some(Box::new(r));
         }
     }
@@ -39,6 +49,13 @@ pub fn description(backend: Backend) -> Option<String> {
     if matches!(backend, Backend::Auto | Backend::Cuda) {
         if let Some(d) = cuda::device_name() {
             return Some(format!("CUDA: {d}"));
+        }
+    }
+    #[cfg(feature = "opencl")]
+    if matches!(backend, Backend::Auto | Backend::OpenCl) {
+        let pick = if backend == Backend::OpenCl { opencl::Pick::AnyGpu } else { opencl::Pick::Auto };
+        if let Some(d) = opencl::device_name(pick) {
+            return Some(format!("OpenCL: {d}"));
         }
     }
     let _ = backend;

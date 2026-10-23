@@ -2,18 +2,18 @@
 
 ## Download
 
-**[Latest release (v0.1.1 beta)](https://github.com/redn3/blue-compressor/releases/tag/v0.1.1)**. Pick the file for your computer:
+**[Latest release (v0.1.3 beta)](https://github.com/redn3/blue-compressor/releases/tag/v0.1.3)**. Pick the file for your computer:
 
 | Your computer | Download |
 | --- | --- |
-| Mac with Apple silicon (M1, M2, M3, M4, M5) | [Blue-Compressor_0.1.1_macOS_arm64.dmg](https://github.com/redn3/blue-compressor/releases/download/v0.1.1/Blue-Compressor_0.1.1_macOS_arm64.dmg) |
-| Mac with Intel processor | [Blue-Compressor_0.1.1_macOS_x64.dmg](https://github.com/redn3/blue-compressor/releases/download/v0.1.1/Blue-Compressor_0.1.1_macOS_x64.dmg) |
-| Windows 10 or 11 | [Blue-Compressor_0.1.1_Windows_x64-setup.exe](https://github.com/redn3/blue-compressor/releases/download/v0.1.1/Blue-Compressor_0.1.1_Windows_x64-setup.exe) |
-| Linux (any distribution) | [Blue-Compressor_0.1.1_Linux_x64.AppImage](https://github.com/redn3/blue-compressor/releases/download/v0.1.1/Blue-Compressor_0.1.1_Linux_x64.AppImage) |
+| Mac with Apple silicon (M1, M2, M3, M4, M5) | [Blue-Compressor_0.1.3_macOS_arm64.dmg](https://github.com/redn3/blue-compressor/releases/download/v0.1.3/Blue-Compressor_0.1.3_macOS_arm64.dmg) |
+| Mac with Intel processor | [Blue-Compressor_0.1.3_macOS_x64.dmg](https://github.com/redn3/blue-compressor/releases/download/v0.1.3/Blue-Compressor_0.1.3_macOS_x64.dmg) |
+| Windows 10 or 11 | [Blue-Compressor_0.1.3_Windows_x64-setup.exe](https://github.com/redn3/blue-compressor/releases/download/v0.1.3/Blue-Compressor_0.1.3_Windows_x64-setup.exe) |
+| Linux (any distribution) | [Blue-Compressor_0.1.3_Linux_x64.AppImage](https://github.com/redn3/blue-compressor/releases/download/v0.1.3/Blue-Compressor_0.1.3_Linux_x64.AppImage) |
 
 Not sure which Mac you have? Open the Apple menu and choose About This Mac. If it says "Chip", get Apple silicon; if it says "Processor" with Intel, get Intel.
 
-Other formats (Windows `.msi`, Linux `.deb` and `.rpm`) and the command line tool are on the [release page](https://github.com/redn3/blue-compressor/releases/tag/v0.1.1).
+Other formats (Windows `.msi`, Linux `.deb` and `.rpm`) and the command line tool are on the [release page](https://github.com/redn3/blue-compressor/releases/tag/v0.1.3).
 
 Blue Compressor makes Nikon **N-RAW** (`.NEV`, e.g. Z8, Z9, Z6III) and **R3D NE**
 (`.R3D`, e.g. Nikon ZR) clips smaller. It re-encodes the TICO RAW (JPEG XS) data inside
@@ -63,7 +63,7 @@ square-root companding transfer curve. Blue Compressor:
 * **6K / 4K**: decodes fully to the Bayer mosaic, then converts to linear raw. It
   area-resamples each CFA plane with phase-correct footprints (a box filter, so no
   ringing next to clipped highlights) and runs the forward transforms again. The
-  geometry stages run on the GPU (Metal on macOS, optional CUDA); entropy coding stays
+  geometry stages run on the GPU (Metal on macOS, optional CUDA and OpenCL); entropy coding stays
   on the CPU.
 
 ## Repository layout
@@ -86,10 +86,10 @@ cargo build --release -p bluecompress-cli
 This also builds the core library: `target/release/libbluecompress.{a,dylib,so}` or
 `bluecompress.{lib,dll}`. Its C header is `crates/core/include/bluecompress.h`.
 
-GPU backends:
+GPU backends (the Windows and Linux desktop app and release CLI builds include both `cuda` and `opencl`):
 
 * **Metal** is on by default on macOS (the shaders are compiled at run time).
-* **CUDA** is behind a feature flag: `cargo build --release -p bluecompress-cli --features cuda`.
+* **CUDA** (NVIDIA) is behind a feature flag: `cargo build --release -p bluecompress-cli --features cuda`.
   The CUDA driver and NVRTC are loaded at run time, so building needs no CUDA toolkit.
   NVRTC is not part of the NVIDIA driver and has to be installed separately. On Windows it
   must be NVRTC **12.x** (`nvrtc64_120_0.dll` plus its `nvrtc-builtins64_12*.dll`), next to
@@ -97,6 +97,12 @@ GPU backends:
   Verified on Windows 11 with an RTX 4060 Ti; Linux and other NVIDIA GPUs are not yet
   tested. Compare its output against `--backend cpu` before relying on it, and please
   report results.
+* **OpenCL** (AMD and other GPUs) is behind a feature flag:
+  `cargo build --release -p bluecompress-cli --features opencl`. The OpenCL loader
+  (`OpenCL.dll` / `libOpenCL.so`) is opened at run time, so building needs no SDK and
+  machines without a driver fall back to the CPU. Requires double precision (`cl_khr_fp64`)
+  to match the CPU output bit for bit. Verified against PoCL in CI, not yet tested on real
+  AMD hardware; please report results.
 
 ### Desktop app
 
@@ -133,7 +139,7 @@ bluecompress probe --json clip.R3D
 bluecompress backends
 ```
 
-Options: `-q 1..4`, `-r original|6k|4k`, `-b auto|cpu|metal|cuda`, `-j threads`,
+Options: `-q 1..4`, `-r original|6k|4k`, `-b auto|cpu|metal|cuda|opencl`, `-j threads`,
 `--suffix`, `--overwrite`, `--skip-existing`, `--json`, `--quiet`.
 
 * **Writing outputs**: each output goes to `<name>.partial` and is renamed when

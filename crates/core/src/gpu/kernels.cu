@@ -1,6 +1,14 @@
 // CUDA kernels for the resize pipeline, compiled at run time with NVRTC. Same kernels
-// and buffer plan as kernels.metal. UNTESTED: never run on an NVIDIA GPU.
+// and buffer plan as kernels.metal and kernels.cl. Written to match the CPU path bit for
+// bit: compiled with --fmad=false, a*b+c fused only where the CPU build fuses it
+// (BC_FMA), and the transfer curve in double precision like Transfer.
+// UNTESTED: never run on an NVIDIA GPU.
 typedef unsigned long long u64;
+#ifdef BC_FMA
+#define MADD(a, b, c) fmaf((a), (b), (c))
+#else
+#define MADD(a, b, c) __fadd_rn(__fmul_rn((a), (b)), (c))
+#endif
 
 __device__ __forceinline__ int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
@@ -141,27 +149,27 @@ extern "C" __global__ void star(int* b, unsigned W, unsigned H, int step) {
 #undef AT
 }
 
-// ---- transfer curve
-extern "C" __global__ void to_raw(const int* src, float* dst, float black, float gain, float knee, u64 n) {
+// ---- transfer curve, in double precision exactly as Transfer::to_raw_f / to_code
+extern "C" __global__ void to_raw(const int* src, float* dst, double black, double gain, double knee, u64 n) {
     const u64 i = u64(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const float d = float(src[i]) + 32768.0f - knee;
-    float q;
-    if (d < 0.0f) {
+    const double d = double(float(src[i])) + 32768.0 - knee;
+    double q;
+    if (d < 0.0) {
         q = -d * d;
     } else {
-        const float t = d * gain / 65536.0f;
+        const double t = d * gain / 65536.0;
         q = t * t;
     }
-    dst[i] = black + (q + 163840.0f) / 262144.0f;
+    dst[i] = float(black + (q + 163840.0) / 262144.0);
 }
 
-extern "C" __global__ void to_code(const float* src, int* dst, float black, float gain, float knee, u64 n) {
+extern "C" __global__ void to_code(const float* src, int* dst, double black, double gain, double knee, u64 n) {
     const u64 i = u64(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const float q = (src[i] - black) * 262144.0f - 163840.0f;
-    const float d = q >= 0.0f ? sqrtf(q) * 65536.0f / gain : -sqrtf(-q);
-    const float v = fminf(fmaxf(roundf(d + knee), 0.0f), 65535.0f);
+    const double q = (double(src[i]) - black) * 262144.0 - 163840.0;
+    const double d = q >= 0.0 ? sqrt(q) * 65536.0 / gain : -sqrt(-q);
+    const double v = fmin(fmax(round(d + knee), 0.0), 65535.0);
     dst[i] = int(v) - 32768;
 }
 
@@ -174,7 +182,7 @@ extern "C" __global__ void rs_h(const float* src, float* dst, const int* tap, co
     const int first = tap[3 * X], count = tap[3 * X + 1], off = tap[3 * X + 2];
     const float* s = src + srcOff + u64(y) * srcStride + first;
     float acc = 0.0f;
-    for (int k = 0; k < count; ++k) acc += wt[off + k] * s[k];
+    for (int k = 0; k < count; ++k) acc = MADD(wt[off + k], s[k], acc);
     dst[dstOff + u64(y) * dw + X] = acc;
 }
 
@@ -185,7 +193,7 @@ extern "C" __global__ void rs_v(const float* src, float* dst, const int* tap, co
     if (X >= dw || Y >= rows) return;
     const int first = tap[3 * Y], count = tap[3 * Y + 1], off = tap[3 * Y + 2];
     float acc = 0.0f;
-    for (int k = 0; k < count; ++k) acc += wt[off + k] * src[srcOff + u64(first + k) * dw + X];
+    for (int k = 0; k < count; ++k) acc = MADD(wt[off + k], src[srcOff + u64(first + k) * dw + X], acc);
     dst[dstOff + u64(Y) * dw + X] = acc;
 }
 

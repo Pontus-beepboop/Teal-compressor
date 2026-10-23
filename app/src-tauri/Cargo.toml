@@ -24,6 +24,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bluecompress = { path = "../../crates/core" }
 
+# GPU resizing on Windows and Linux: CUDA (NVIDIA) and OpenCL (AMD). The driver libraries
+# are opened at run time, so machines without a GPU driver just use the CPU.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+bluecompress = { path = "../../crates/core", features = ["cuda", "opencl"] }
+
 [features]
 # Fakes probe/transcode with realistic numbers, for UI work without the real core.
 mock = []

@@ -1,5 +1,6 @@
 //! Resolution change: full decode to the Bayer mosaic, area resampling of each CFA plane,
-//! and re-encode. Backends: CPU (rayon), Metal (macOS), CUDA (optional feature).
+//! and re-encode. Backends: CPU (rayon), Metal (macOS), CUDA and OpenCL
+//! (optional features).
 
 use rayon::prelude::*;
 
@@ -64,29 +65,43 @@ impl Resizer for CpuResizer {
         let (h, ls, ld) = parse_source(cs, &self.src, &self.dst)?;
         let mut coeffs = vec![0i32; Coeffs::len(&ls)];
         decode_frame(cs, &h, &ls, &mut coeffs)?;
-        let mut pl = Planes::default();
-        inverse_wavelet(&ls, &mut coeffs, &mut pl);
-        drop(coeffs);
-        inverse_star_tetrix(&mut pl);
-
-        let tr = Transfer::new(&h);
-        let mut dp = Planes::new(ld.cw, ld.ch);
-        let (sn, dn) = (pl.w * pl.h, dp.w * dp.h);
-        dp.data.par_chunks_mut(dn).enumerate().for_each(|(c, out)| {
-            let src: Vec<f32> = pl.data[c * sn..(c + 1) * sn].iter().map(|&v| tr.to_raw_f(v as f32)).collect();
-            let mut dst = vec![0f32; dn];
-            let mut scratch = Vec::new();
-            resample_plane(&src, pl.w, pl.h, &mut dst, ld.cw, ld.ch, &self.tx[c], &self.ty[c], &mut scratch);
-            for (o, &v) in out.iter_mut().zip(&dst) {
-                *o = tr.to_code(v);
-            }
-        });
-        drop(pl);
-        forward_star_tetrix(&mut dp);
-        let mut dc = vec![0i32; Coeffs::len(&ld)];
-        forward_wavelet(&ld, &dp, &mut dc);
+        let dc = resize_coeffs(&h, &ls, &ld, coeffs, &self.tx, &self.ty);
         encode_frame(&h, &ld, &dc, encode_rank_for_quality(quality))
     }
+}
+
+/// The pixel stages of a resize on the CPU: source coefficients (layout `ls`) to
+/// destination coefficients (layout `ld`). The GPU backends implement the same function.
+pub fn resize_coeffs(
+    h: &TicoHeader,
+    ls: &Layout,
+    ld: &Layout,
+    mut coeffs: Vec<i32>,
+    tx: &[Taps; 4],
+    ty: &[Taps; 4],
+) -> Vec<i32> {
+    let mut pl = Planes::default();
+    inverse_wavelet(ls, &mut coeffs, &mut pl);
+    drop(coeffs);
+    inverse_star_tetrix(&mut pl);
+
+    let tr = Transfer::new(h);
+    let mut dp = Planes::new(ld.cw, ld.ch);
+    let (sn, dn) = (pl.w * pl.h, dp.w * dp.h);
+    dp.data.par_chunks_mut(dn).enumerate().for_each(|(c, out)| {
+        let src: Vec<f32> = pl.data[c * sn..(c + 1) * sn].iter().map(|&v| tr.to_raw_f(v as f32)).collect();
+        let mut dst = vec![0f32; dn];
+        let mut scratch = Vec::new();
+        resample_plane(&src, pl.w, pl.h, &mut dst, ld.cw, ld.ch, &tx[c], &ty[c], &mut scratch);
+        for (o, &v) in out.iter_mut().zip(&dst) {
+            *o = tr.to_code(v);
+        }
+    });
+    drop(pl);
+    forward_star_tetrix(&mut dp);
+    let mut dc = vec![0i32; Coeffs::len(ld)];
+    forward_wavelet(ld, &dp, &mut dc);
+    dc
 }
 
 /// Picks a resizer for the backend: GPU when requested or available, else CPU.
@@ -95,7 +110,7 @@ pub fn create(backend: Backend, src: Geometry, dst: Geometry) -> Result<Box<dyn 
         if let Some(gpu) = crate::gpu::create(backend, src, dst) {
             return Ok(gpu);
         }
-        if matches!(backend, Backend::Metal | Backend::Cuda) {
+        if matches!(backend, Backend::Metal | Backend::Cuda | Backend::OpenCl) {
             return Err(Error(format!("{backend:?} backend is not available on this machine")));
         }
     }
