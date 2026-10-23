@@ -323,6 +323,8 @@ version = "0.1.3"
 dependencies = [
  "bluecompress",
  "ctrlc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

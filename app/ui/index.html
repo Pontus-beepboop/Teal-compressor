@@ -18,6 +18,7 @@
         </div>
       </div>
       <div class="titlebar-right" data-tauri-drag-region>
+        <span class="chip" id="watch-chip" title="Watch folder daemon" hidden><span class="chip-dot" id="watch-dot"></span><span id="watch-chip-text">Watch</span></span>
         <span class="chip" id="engine-chip" title="Processor"><span class="chip-dot"></span><span id="engine-text">Starting</span></span>
       </div>
     </header>
@@ -81,6 +82,21 @@
           <p class="hint dest-hint" id="dest-hint"></p>
         </section>
 
+        <section class="field" id="watch-section" hidden>
+          <div class="field-label">Watch folder</div>
+          <div class="watch-card">
+            <div class="watch-head">
+              <span class="watch-preset" id="watch-preset"></span>
+              <span class="job-pill" id="watch-pill">Watching</span>
+            </div>
+            <div class="watch-dirs" id="watch-dirs"></div>
+            <div class="watch-stats" id="watch-stats"></div>
+            <div class="meter watch-meter" id="watch-meter" hidden>
+              <div class="meter-fill" id="watch-meter-fill"></div>
+            </div>
+          </div>
+        </section>
+
         <div class="beta-note">
           <svg viewBox="0 0 16 16" class="ico-sm"><path d="M8 5.2v3.3m0 2.2v.1M7 2.3 1.6 11.6c-.5.8.1 1.9 1.1 1.9h10.6c1 0 1.6-1.1 1.1-1.9L9 2.3c-.4-.8-1.6-.8-2 0Z"/></svg>
           <span><b>Beta software.</b> Keep your digital negatives (the original clips) until you have checked the compressed copies yourself.</span>
@@ -113,7 +129,7 @@
               </div>
               <svg viewBox="0 0 24 24" class="drop-arrow"><path d="M12 4v11m0 0-4.5-4.5M12 15l4.5-4.5M5 19h14"/></svg>
             </div>
-            <div class="drop-title">Drop clips or folders here</div>
+            <div class="drop-title" id="drop-title">Drop clips or folders here</div>
             <div class="drop-sub">Nikon N-RAW <span class="kbd">.NEV</span> and R3D NE <span class="kbd">.R3D</span>, any number at once</div>
             <div class="drop-buttons">
               <button class="btn primary-soft" id="empty-add">Choose Clips</button>
@@ -232,6 +248,45 @@
       <p>It has been tested on only a few cameras and clips. Do not delete your digital negatives (the original clips) until you have opened the compressed copies in your own software and checked them yourself.</p>
       <div class="modal-buttons">
         <button class="btn primary" id="beta-ok">I understand</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal" id="fs-modal" role="dialog" aria-modal="true" aria-labelledby="fs-title">
+    <div class="modal-card fs-card">
+      <div class="fs-head">
+        <div>
+          <h3 id="fs-title">Browse Files</h3>
+          <div class="fs-sub" id="fs-sub"></div>
+        </div>
+        <button class="icon-btn" id="fs-close" title="Close (Esc)">
+          <svg viewBox="0 0 16 16"><path d="m4.5 4.5 7 7m0-7-7 7"/></svg>
+        </button>
+      </div>
+      <div class="fs-roots" id="fs-roots"></div>
+      <div class="fs-nav">
+        <button class="btn ghost" id="fs-up" title="Parent folder">
+          <svg viewBox="0 0 16 16" class="ico-sm"><path d="m4.5 9.5 3.5-3.5 3.5 3.5"/></svg>Up
+        </button>
+        <input type="text" class="fs-input" id="fs-path-input" spellcheck="false" autocomplete="off">
+        <button class="btn ghost" id="fs-go">Go</button>
+        <button class="btn ghost" id="fs-select-all" hidden>Select All Clips</button>
+        <button class="btn ghost" id="fs-mkdir-toggle" hidden>New Folder</button>
+      </div>
+      <div class="fs-mkdir-row" id="fs-mkdir-row" hidden>
+        <input type="text" class="fs-input" id="fs-mkdir-input" placeholder="New folder name" spellcheck="false" autocomplete="off">
+        <button class="btn primary-soft" id="fs-mkdir-create">Create</button>
+        <button class="btn ghost" id="fs-mkdir-cancel">Cancel</button>
+      </div>
+      <div class="fs-error" id="fs-error" hidden></div>
+      <div class="fs-list" id="fs-list"></div>
+      <div class="fs-foot">
+        <div class="fs-summary" id="fs-summary"></div>
+        <div class="fs-buttons">
+          <button class="btn ghost" id="fs-cancel">Cancel</button>
+          <button class="btn ghost" id="fs-add-current-dir" hidden>Add Current Folder</button>
+          <button class="btn primary" id="fs-confirm">Select</button>
+        </div>
       </div>
     </div>
   </div>

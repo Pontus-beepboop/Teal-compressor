@@ -10,6 +10,7 @@
 | Mac with Intel processor | [Blue-Compressor_0.1.3_macOS_x64.dmg](https://github.com/redn3/blue-compressor/releases/download/v0.1.3/Blue-Compressor_0.1.3_macOS_x64.dmg) |
 | Windows 10 or 11 | [Blue-Compressor_0.1.3_Windows_x64-setup.exe](https://github.com/redn3/blue-compressor/releases/download/v0.1.3/Blue-Compressor_0.1.3_Windows_x64-setup.exe) |
 | Linux (any distribution) | [Blue-Compressor_0.1.3_Linux_x64.AppImage](https://github.com/redn3/blue-compressor/releases/download/v0.1.3/Blue-Compressor_0.1.3_Linux_x64.AppImage) |
+| Docker / Synology NAS (`amd64` and `arm64`) | `docker pull ghcr.io/redn3/blue-compressor:latest` ([setup guide](#docker-and-synology-nas)) |
 
 Not sure which Mac you have? Open the Apple menu and choose About This Mac. If it says "Chip", get Apple silicon; if it says "Processor" with Intel, get Intel.
 
@@ -135,6 +136,12 @@ bluecompress compress -q 3 -r 6k clip.NEV --output clip_6k.NEV
 # Machine-readable progress for build servers (one JSON object per line)
 bluecompress compress --json --skip-existing footage/ -o out/
 
+# Watch a folder for incoming clips and write compressed copies to another folder
+bluecompress watch --input /watch/in --output /watch/out -q 3 -r original
+
+# Start the Web UI server (port 9847 by default) with optional background watch folder
+bluecompress serve --listen 0.0.0.0:9847 --watch-input /watch/in --watch-output /watch/out
+
 bluecompress probe --json clip.R3D
 bluecompress backends
 ```
@@ -147,6 +154,85 @@ Options: `-q 1..4`, `-r original|6k|4k`, `-b auto|cpu|metal|cuda|opencl`, `-j th
 * **Exit codes**: 0 success, 1 a clip failed, 2 usage error, 3 cancelled.
 * **JSON events**: `start`, `progress`, `done`, `skipped`, `error`, `summary`. The `probe`
   command emits `clip` events instead.
+
+## Docker and Synology NAS
+
+The official multi-arch image (`ghcr.io/redn3/blue-compressor:latest`, built for both `linux/amd64` and `linux/arm64`) packs three modes into one container:
+
+1. **Web UI on port `9847`**: the full Blue Compressor interface in your browser, with a server-side folder browser for NAS shares, live queue progress, and the before/after quality previewer.
+2. **Watch-folder daemon**: watches `/watch/in` recursively for `.NEV` and `.R3D` clips, waits for incoming SMB/AFP network copies to finish (size and modification time stable across polls), and writes compressed copies to `/watch/out` atomically while preserving subfolder structure.
+3. **Command line (`bluecompress`)**: pass any subcommand (`compress`, `probe`, `watch`, `backends`) to run it directly.
+
+### Quick start (`docker run`)
+
+```bash
+docker run -d \
+  --name blue-compressor \
+  --restart unless-stopped \
+  -p 9847:9847 \
+  -v /volume1/video:/media \
+  -v /volume1/video/watch-in:/watch/in \
+  -v /volume1/video/watch-out:/watch/out \
+  -e WATCH_QUALITY=3 \
+  -e WATCH_RESOLUTION=original \
+  ghcr.io/redn3/blue-compressor:latest
+```
+
+Then open `http://<nas-ip>:9847` in your browser.
+
+### Docker Compose / Synology Container Manager
+
+A ready-to-use [`docker-compose.yml`](docker-compose.yml) is included at the repository root:
+
+```yaml
+services:
+  blue-compressor:
+    image: ghcr.io/redn3/blue-compressor:latest
+    container_name: blue-compressor
+    restart: unless-stopped
+    ports:
+      - "9847:9847"
+    environment:
+      - PORT=9847
+      - BROWSE_ROOT=/
+      - WATCH_ENABLED=true
+      - WATCH_INPUT=/watch/in
+      - WATCH_OUTPUT=/watch/out
+      - WATCH_QUALITY=3
+      - WATCH_RESOLUTION=original
+      - WATCH_POLL_SECONDS=5
+    volumes:
+      - /volume1/video:/media
+      - /volume1/video/watch-in:/watch/in
+      - /volume1/video/watch-out:/watch/out
+```
+
+On Synology DSM, open **Container Manager** > **Project** > **Create**, paste the `docker-compose.yml` above (adjusting `/volume1/video` to match your shared folder), and build.
+
+### Environment variables
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `PORT` | `9847` | Port for the Web UI server (`0.0.0.0:$PORT`). |
+| `BROWSE_ROOT` | `/` | Root directory accessible in the Web UI file browser. |
+| `WATCH_ENABLED` | `true` | Set to `false` or `0` to disable the background watch-folder loop. |
+| `WATCH_INPUT` | `/watch/in` | Folder watched recursively for incoming `.NEV` and `.R3D` clips. |
+| `WATCH_OUTPUT` | `/watch/out` | Destination folder for watch-folder outputs (relative paths kept). |
+| `WATCH_QUALITY` | `3` | Quality preset for watch-folder jobs: `1` (`lossless`), `2` (`archival`), `3` (`high`), or `4` (`compact`). |
+| `WATCH_RESOLUTION` | `original` | Output resolution for watch-folder jobs: `original`, `6k`, or `4k`. |
+| `WATCH_POLL_SECONDS` | `5` | Seconds between watch-folder scans and file-copy stability checks. |
+
+### One-off CLI runs with Docker
+
+Because the image `ENTRYPOINT` is `bluecompress`, you can also invoke any CLI command directly:
+
+```bash
+docker run --rm -v "$PWD":/data ghcr.io/redn3/blue-compressor:latest \
+  compress -q 2 /data/clip.NEV --output /data/clip_q2.NEV
+
+docker run --rm -v "$PWD":/data ghcr.io/redn3/blue-compressor:latest \
+  probe /data/clip.NEV
+```
 
 ## C API
 

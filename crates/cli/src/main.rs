@@ -1,7 +1,9 @@
-//! bluecompress: headless command line front end (scripts, build servers, batch jobs).
+//! bluecompress: headless command line front end, watch-folder daemon, and Web UI server.
 //!
 //!   bluecompress compress [options] <input|folder>... -o <output folder>
 //!   bluecompress compress [options] <input> --output <file>
+//!   bluecompress watch --input <folder> --output <folder> [options]
+//!   bluecompress serve [--listen 0.0.0.0:9847] [options]
 //!   bluecompress probe [--json] <input|folder>...
 //!   bluecompress backends [--json]
 //!   bluecompress version
@@ -11,16 +13,20 @@
 //! skipped, error, summary); human readable messages go to stderr.
 //! Exit codes: 0 success, 1 at least one clip failed, 2 usage error, 3 cancelled.
 
+mod serve;
+mod watch;
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use bluecompress::{Backend, ClipInfo, Codec, Options, Resolution};
 
 static CANCEL: AtomicBool = AtomicBool::new(false);
 
-fn q(s: &str) -> String {
+pub(crate) fn q(s: &str) -> String {
     let mut o = String::with_capacity(s.len() + 2);
     o.push('"');
     for c in s.chars() {
@@ -38,23 +44,72 @@ fn q(s: &str) -> String {
     o
 }
 
-fn ps(p: &Path) -> String {
+pub(crate) fn ps(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
 
+pub(crate) fn resolution_name(r: Resolution) -> &'static str {
+    match r {
+        Resolution::Original => "original",
+        Resolution::K6 => "6k",
+        Resolution::K4 => "4k",
+    }
+}
+
+fn parse_quality(s: &str) -> Option<u8> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "1" | "q1" | "lossless" => Some(1),
+        "2" | "q2" | "archival" => Some(2),
+        "3" | "q3" | "high" | "balanced" => Some(3),
+        "4" | "q4" | "compact" | "max" => Some(4),
+        _ => None,
+    }
+}
+
+fn parse_resolution(s: &str) -> Option<Resolution> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "original" | "orig" => Some(Resolution::Original),
+        "6k" => Some(Resolution::K6),
+        "4k" | "uhd" => Some(Resolution::K4),
+        _ => None,
+    }
+}
+
+fn parse_backend(s: &str) -> Option<Backend> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "auto" | "gpu" => Some(Backend::Auto),
+        "cpu" => Some(Backend::Cpu),
+        "metal" => Some(Backend::Metal),
+        "cuda" => Some(Backend::Cuda),
+        "opencl" => Some(Backend::OpenCl),
+        _ => None,
+    }
+}
+
+fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
 struct Cli {
-    quality: u8,
-    resolution: Resolution,
-    backend: Backend,
+    quality: Option<u8>,
+    resolution: Option<Resolution>,
+    backend: Option<Backend>,
     threads: usize,
     inputs: Vec<String>,
+    input_dir: Option<String>,
     output_dir: Option<String>,
     output_file: Option<String>,
+    watch_input: Option<String>,
+    watch_output: Option<String>,
+    listen: Option<String>,
+    browse_root: Option<String>,
+    poll_seconds: Option<u64>,
     suffix: String,
     json: bool,
     quiet: bool,
     overwrite: bool,
     skip_existing: bool,
+    once: bool,
 }
 
 fn usage() -> String {
@@ -64,6 +119,8 @@ fn usage() -> String {
 usage:
   bluecompress compress [options] <clip|folder>... -o <output folder>
   bluecompress compress [options] <clip> --output <file>
+  bluecompress watch --input <folder> --output <folder> [options]
+  bluecompress serve [--listen 0.0.0.0:9847] [options]
   bluecompress probe [--json] <clip|folder>...
   bluecompress backends [--json]
   bluecompress version
@@ -83,6 +140,15 @@ options:
       --json              JSON lines on stdout (start, progress, done, skipped, error, summary)
       --quiet             no progress on stderr
 
+serve and watch options:
+      --listen ADDR       Web UI address for serve (default: 0.0.0.0:${{PORT:-9847}})
+      --browse-root DIR   root folder exposed in the Web UI browser (default: BROWSE_ROOT or /)
+      --input, --watch-input DIR
+                          watch input folder (default: WATCH_INPUT or /watch/in)
+      --watch-output DIR  watch output folder (default: WATCH_OUTPUT or /watch/out)
+      --poll-seconds N    watch poll interval in seconds (default: WATCH_POLL_SECONDS or 5)
+      --once              watch: run one scan pass on stable files and exit
+
 Folders are searched recursively for .nev and .r3d files. Originals are never modified;
 outputs are written to <name>.partial and renamed when complete.
 exit codes: 0 success, 1 a clip failed, 2 usage error, 3 cancelled
@@ -91,7 +157,7 @@ exit codes: 0 success, 1 a clip failed, 2 usage error, 3 cancelled
     )
 }
 
-fn is_clip(p: &Path) -> bool {
+pub(crate) fn is_clip(p: &Path) -> bool {
     p.extension()
         .and_then(|e| e.to_str())
         .map(|e| e.eq_ignore_ascii_case("nev") || e.eq_ignore_ascii_case("r3d"))
@@ -130,7 +196,7 @@ fn expand(inputs: &[String], missing: &mut Vec<String>) -> Vec<PathBuf> {
     out
 }
 
-fn codec_name(i: &ClipInfo) -> &'static str {
+pub(crate) fn codec_name(i: &ClipInfo) -> &'static str {
     if i.codec == Codec::R3dNe {
         "R3D NE"
     } else {
@@ -138,7 +204,7 @@ fn codec_name(i: &ClipInfo) -> &'static str {
     }
 }
 
-fn fourcc(i: &ClipInfo) -> &'static str {
+pub(crate) fn fourcc(i: &ClipInfo) -> &'static str {
     if i.codec == Codec::R3dNe {
         "NR3D"
     } else {
@@ -230,6 +296,9 @@ fn backends_cmd(o: &Cli) -> u8 {
 }
 
 fn compress_cmd(o: &Cli) -> u8 {
+    let quality = o.quality.unwrap_or(2);
+    let resolution = o.resolution.unwrap_or(Resolution::Original);
+    let backend = o.backend.unwrap_or(Backend::Auto);
     let mut missing = Vec::new();
     let inputs = expand(&o.inputs, &mut missing);
     if inputs.is_empty() && missing.is_empty() {
@@ -299,7 +368,7 @@ fn compress_cmd(o: &Cli) -> u8 {
         }
 
         if let Ok(info) = bluecompress::probe(input) {
-            let (ow, oh) = bluecompress::output_size(info.width, info.height, o.resolution);
+            let (ow, oh) = bluecompress::output_size(info.width, info.height, resolution);
             if o.json {
                 println!(
                     "{{\"event\":\"start\",\"input\":{},\"output\":{},\"codec\":{},\"width\":{},\"height\":{},\
@@ -310,7 +379,7 @@ fn compress_cmd(o: &Cli) -> u8 {
                     info.width,
                     info.height,
                     info.frames,
-                    o.quality
+                    quality
                 );
             } else if !o.quiet {
                 eprintln!(
@@ -320,20 +389,14 @@ fn compress_cmd(o: &Cli) -> u8 {
                     info.height,
                     info.frames,
                     info.fps,
-                    o.quality
+                    quality
                 );
             }
             let _ = stdout.flush();
         }
 
-        let opt = Options {
-            input: input.clone(),
-            output: out.clone(),
-            quality: o.quality,
-            resolution: o.resolution,
-            backend: o.backend,
-            threads: o.threads,
-        };
+        let opt =
+            Options { input: input.clone(), output: out.clone(), quality, resolution, backend, threads: o.threads };
         let mut last_permille = -1i64;
         let result = bluecompress::transcode(&opt, &CANCEL, &mut |fraction, fps| {
             let pm = (fraction * 1000.0) as i64;
@@ -425,6 +488,151 @@ fn compress_cmd(o: &Cli) -> u8 {
     }
 }
 
+fn env_watch_quality(cli_q: Option<u8>) -> u8 {
+    cli_q
+        .or_else(|| env_nonempty("WATCH_QUALITY").and_then(|v| parse_quality(&v)))
+        .or_else(|| env_nonempty("QUALITY").and_then(|v| parse_quality(&v)))
+        .unwrap_or(3)
+}
+
+fn env_watch_resolution(cli_r: Option<Resolution>) -> Resolution {
+    cli_r
+        .or_else(|| env_nonempty("WATCH_RESOLUTION").and_then(|v| parse_resolution(&v)))
+        .or_else(|| env_nonempty("RESOLUTION").and_then(|v| parse_resolution(&v)))
+        .unwrap_or(Resolution::Original)
+}
+
+fn env_watch_backend(cli_b: Option<Backend>) -> Backend {
+    cli_b
+        .or_else(|| env_nonempty("WATCH_BACKEND").and_then(|v| parse_backend(&v)))
+        .or_else(|| env_nonempty("BACKEND").and_then(|v| parse_backend(&v)))
+        .unwrap_or(Backend::Auto)
+}
+
+fn env_watch_poll(cli_p: Option<u64>) -> u64 {
+    cli_p.or_else(|| env_nonempty("WATCH_POLL_SECONDS").and_then(|v| v.parse().ok())).unwrap_or(5)
+}
+
+fn watch_cmd(o: &Cli) -> u8 {
+    let input = o
+        .watch_input
+        .clone()
+        .or_else(|| o.input_dir.clone())
+        .or_else(|| o.inputs.first().cloned())
+        .or_else(|| env_nonempty("WATCH_INPUT"));
+    let output = o
+        .watch_output
+        .clone()
+        .or_else(|| o.output_dir.clone())
+        .or_else(|| o.output_file.clone())
+        .or_else(|| o.inputs.get(1).cloned())
+        .or_else(|| env_nonempty("WATCH_OUTPUT"));
+
+    let (Some(in_dir), Some(out_dir)) = (input, output) else {
+        eprintln!("error: watch requires --input <folder> and --output <folder>");
+        return 2;
+    };
+
+    let cfg = watch::WatchConfig {
+        input_dir: PathBuf::from(in_dir),
+        output_dir: PathBuf::from(out_dir),
+        quality: env_watch_quality(o.quality),
+        resolution: env_watch_resolution(o.resolution),
+        backend: env_watch_backend(o.backend),
+        threads: o.threads,
+        poll_seconds: env_watch_poll(o.poll_seconds),
+        json: o.json,
+        quiet: o.quiet,
+        once: o.once,
+    };
+    let state = Arc::new(Mutex::new(watch::WatchSnapshot::default()));
+    watch::run_watch(cfg, &CANCEL, state, None, None)
+}
+
+fn normalize_listen(s: &str) -> String {
+    let t = s.trim();
+    if t.chars().all(|c| c.is_ascii_digit()) {
+        format!("0.0.0.0:{t}")
+    } else if let Some(port) = t.strip_prefix(':') {
+        format!("0.0.0.0:{port}")
+    } else {
+        t.to_string()
+    }
+}
+
+fn serve_cmd(o: &Cli) -> u8 {
+    let port = env_nonempty("PORT").unwrap_or_else(|| "9847".into());
+    let listen = o
+        .listen
+        .as_deref()
+        .map(normalize_listen)
+        .or_else(|| env_nonempty("LISTEN").map(|s| normalize_listen(&s)))
+        .unwrap_or_else(|| format!("0.0.0.0:{port}"));
+
+    let browse_root = o
+        .browse_root
+        .clone()
+        .or_else(|| env_nonempty("BROWSE_ROOT"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"));
+
+    let watch_enabled_env = env_nonempty("WATCH_ENABLED").map(|v| v.to_ascii_lowercase());
+    let explicitly_disabled = matches!(watch_enabled_env.as_deref(), Some("false" | "0" | "no" | "off"));
+    let explicitly_enabled = matches!(watch_enabled_env.as_deref(), Some("true" | "1" | "yes" | "on"));
+
+    let watch_in = o.watch_input.clone().or_else(|| o.input_dir.clone()).or_else(|| env_nonempty("WATCH_INPUT"));
+    let watch_out = o.watch_output.clone().or_else(|| o.output_dir.clone()).or_else(|| env_nonempty("WATCH_OUTPUT"));
+
+    let watch_cfg = if explicitly_disabled {
+        None
+    } else if let Some(in_dir) = watch_in {
+        let out_dir = watch_out.unwrap_or_else(|| {
+            if Path::new("/watch/out").exists() {
+                "/watch/out".into()
+            } else {
+                format!("{in_dir}/Compressed")
+            }
+        });
+        Some(watch::WatchConfig {
+            input_dir: PathBuf::from(in_dir),
+            output_dir: PathBuf::from(out_dir),
+            quality: env_watch_quality(o.quality),
+            resolution: env_watch_resolution(o.resolution),
+            backend: env_watch_backend(o.backend),
+            threads: o.threads,
+            poll_seconds: env_watch_poll(o.poll_seconds),
+            json: o.json,
+            quiet: o.quiet,
+            once: false,
+        })
+    } else if explicitly_enabled || (Path::new("/watch/in").is_dir() && Path::new("/watch/out").is_dir()) {
+        Some(watch::WatchConfig {
+            input_dir: PathBuf::from("/watch/in"),
+            output_dir: PathBuf::from(watch_out.unwrap_or_else(|| "/watch/out".into())),
+            quality: env_watch_quality(o.quality),
+            resolution: env_watch_resolution(o.resolution),
+            backend: env_watch_backend(o.backend),
+            threads: o.threads,
+            poll_seconds: env_watch_poll(o.poll_seconds),
+            json: o.json,
+            quiet: o.quiet,
+            once: false,
+        })
+    } else {
+        None
+    };
+
+    let cfg = serve::ServeConfig {
+        listen,
+        browse_root,
+        initial_paths: o.inputs.clone(),
+        default_backend: env_watch_backend(o.backend),
+        threads: o.threads,
+        watch: watch_cfg,
+    };
+    serve::run_serve(cfg, &CANCEL)
+}
+
 fn bad(what: &str) -> ExitCode {
     eprintln!("error: {what} (see bluecompress --help)");
     ExitCode::from(2)
@@ -433,23 +641,30 @@ fn bad(what: &str) -> ExitCode {
 fn main() -> ExitCode {
     let _ = ctrlc::set_handler(|| CANCEL.store(true, Ordering::Relaxed));
     let mut o = Cli {
-        quality: 2,
-        resolution: Resolution::Original,
-        backend: Backend::Auto,
-        threads: 0,
+        quality: None,
+        resolution: None,
+        backend: None,
+        threads: env_nonempty("THREADS").and_then(|v| v.parse().ok()).unwrap_or(0),
         inputs: Vec::new(),
+        input_dir: None,
         output_dir: None,
         output_file: None,
+        watch_input: None,
+        watch_output: None,
+        listen: None,
+        browse_root: None,
+        poll_seconds: None,
         suffix: String::new(),
         json: false,
         quiet: false,
         overwrite: false,
         skip_existing: false,
+        once: false,
     };
     let args: Vec<String> = std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
     let mut it = args.into_iter().peekable();
     let cmd = match it.peek().map(String::as_str) {
-        Some(c @ ("compress" | "probe" | "backends" | "version")) => {
+        Some(c @ ("compress" | "probe" | "backends" | "version" | "serve" | "watch")) => {
             let c = c.to_string();
             it.next();
             c
@@ -462,42 +677,63 @@ fn main() -> ExitCode {
                 print!("{}", usage());
                 return ExitCode::SUCCESS;
             }
-            "-q" | "--quality" => match it.next().and_then(|v| v.parse::<u8>().ok()).filter(|v| (1..=4).contains(v)) {
-                Some(v) => o.quality = v,
-                None => return bad("quality must be 1 to 4"),
+            "-q" | "--quality" => match it.next().and_then(|v| parse_quality(&v)) {
+                Some(v) => o.quality = Some(v),
+                None => return bad("quality must be 1 to 4 (or lossless, archival, high, compact)"),
             },
-            "-r" | "--resolution" => {
-                o.resolution = match it.next().unwrap_or_default().to_ascii_lowercase().as_str() {
-                    "6k" => Resolution::K6,
-                    "4k" => Resolution::K4,
-                    "original" | "orig" => Resolution::Original,
-                    _ => return bad("resolution must be original, 6k or 4k"),
-                }
-            }
-            "-b" | "--backend" => {
-                o.backend = match it.next().unwrap_or_default().as_str() {
-                    "auto" | "gpu" => Backend::Auto,
-                    "cpu" => Backend::Cpu,
-                    "metal" => Backend::Metal,
-                    "cuda" => Backend::Cuda,
-                    "opencl" => Backend::OpenCl,
-                    _ => return bad("backend must be auto, cpu, metal or cuda"),
-                }
-            }
-            "--cpu" => o.backend = Backend::Cpu,
-            "--gpu" => o.backend = Backend::Auto,
+            "-r" | "--resolution" => match it.next().and_then(|v| parse_resolution(&v)) {
+                Some(r) => o.resolution = Some(r),
+                None => return bad("resolution must be original, 6k or 4k"),
+            },
+            "-b" | "--backend" => match it.next().and_then(|v| parse_backend(&v)) {
+                Some(b) => o.backend = Some(b),
+                None => return bad("backend must be auto, cpu, metal, cuda or opencl"),
+            },
+            "--cpu" => o.backend = Some(Backend::Cpu),
+            "--gpu" => o.backend = Some(Backend::Auto),
             "-j" | "--threads" => match it.next().and_then(|v| v.parse::<usize>().ok()).filter(|v| *v <= 1024) {
                 Some(v) => o.threads = v,
                 None => return bad("threads must be a number"),
+            },
+            "-i" | "--input" => match it.next() {
+                Some(v) => o.input_dir = Some(v),
+                None => return bad("--input needs a folder"),
             },
             "-o" | "--output-dir" => match it.next() {
                 Some(v) => o.output_dir = Some(v),
                 None => return bad("-o needs a folder"),
             },
             "--output" => match it.next() {
-                Some(v) => o.output_file = Some(v),
-                None => return bad("--output needs a file"),
+                Some(v) => {
+                    if cmd == "watch" {
+                        o.watch_output = Some(v);
+                    } else {
+                        o.output_file = Some(v);
+                    }
+                }
+                None => return bad("--output needs a path"),
             },
+            "--watch-input" => match it.next() {
+                Some(v) => o.watch_input = Some(v),
+                None => return bad("--watch-input needs a folder"),
+            },
+            "--watch-output" => match it.next() {
+                Some(v) => o.watch_output = Some(v),
+                None => return bad("--watch-output needs a folder"),
+            },
+            "-l" | "--listen" | "-p" | "--port" => match it.next() {
+                Some(v) => o.listen = Some(v),
+                None => return bad("--listen needs an address or port"),
+            },
+            "--browse-root" => match it.next() {
+                Some(v) => o.browse_root = Some(v),
+                None => return bad("--browse-root needs a folder"),
+            },
+            "--poll-seconds" => match it.next().and_then(|v| v.parse::<u64>().ok()) {
+                Some(v) => o.poll_seconds = Some(v),
+                None => return bad("--poll-seconds must be a number"),
+            },
+            "--once" => o.once = true,
             "--suffix" => match it.next() {
                 Some(v) => o.suffix = v,
                 None => return bad("--suffix needs a value"),
@@ -521,6 +757,8 @@ fn main() -> ExitCode {
             0
         }
         "backends" => backends_cmd(&o),
+        "serve" => serve_cmd(&o),
+        "watch" => watch_cmd(&o),
         _ if o.inputs.is_empty() => {
             eprint!("{}", usage());
             2
@@ -540,4 +778,346 @@ fn main() -> ExitCode {
         }
     };
     ExitCode::from(rc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpStream;
+
+    fn box_wrap(tag: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let len = (8 + payload.len()) as u32;
+        let mut out = Vec::with_capacity(len as usize);
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(tag);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn make_synthetic_nev(path: &Path, width: u16, height: u16, nframes: usize) {
+        let mut hdr = Vec::new();
+        hdr.extend_from_slice(&[0xff, 0x10]); // SOC
+        let mut pih = vec![0u8; 37];
+        pih[8..10].copy_from_slice(&width.to_be_bytes());
+        pih[10..12].copy_from_slice(&height.to_be_bytes());
+        pih[14..16].copy_from_slice(&8u16.to_be_bytes());
+        pih[16] = 4;
+        pih[17] = 4;
+        pih[18] = 8;
+        pih[20] = 0x44;
+        pih[21] = 0x10;
+        pih[22] = 0x01;
+        pih[23] = 0x14;
+        pih[24 + 3] = 0x02;
+        pih[24 + 4] = 0x58; // black = 600
+        pih[24 + 7] = 0x01; // gain = 65536
+        pih[24 + 10] = 0x08; // knee = 2048
+        hdr.extend_from_slice(&[0xff, 0x12, 0x00, 39]);
+        hdr.extend_from_slice(&pih);
+
+        // CDT: 4 components (hl=[5,5,0,5], vl=[1,1,0,1]) -> 37 bands
+        hdr.extend_from_slice(&[0xff, 0x13, 0x00, 14]);
+        for (hl, vl) in [(5u8, 1u8), (5, 1), (0, 0), (5, 1)] {
+            hdr.extend_from_slice(&[14, 0x11, (hl << 4) | vl]);
+        }
+
+        let nbands = 25usize;
+        hdr.extend_from_slice(&[0xff, 0x14]);
+        hdr.extend_from_slice(&((2 + 2 * nbands) as u16).to_be_bytes());
+        for i in 0..nbands {
+            hdr.extend_from_slice(&[4, i as u8]);
+        }
+        let mut parse_buf = hdr.clone();
+        parse_buf.extend_from_slice(&[0xff, 0x20, 0x00, 0x04, 0x00, 0x00]);
+        let (th, _) = bluecompress::tico::TicoHeader::parse(&parse_buf).unwrap();
+        let layout = bluecompress::tico::Layout::make(&th, width as usize, height as usize).unwrap();
+
+        let mut pl = bluecompress::frame::Planes::new(layout.cw, layout.ch);
+        for (i, v) in pl.data.iter_mut().enumerate() {
+            *v = ((i as i32 * 37) % 4096) - 2048;
+        }
+        bluecompress::frame::forward_star_tetrix(&mut pl);
+        let mut coeffs = vec![0i32; bluecompress::frame::Coeffs::len(&layout)];
+        bluecompress::frame::forward_wavelet(&layout, &pl, &mut coeffs);
+        let cs = bluecompress::frame::encode_frame(&th, &layout, &coeffs, 10).unwrap();
+
+        // Build NRAW sample wrapper
+        let mut nrmt_w = vec![0x01, 0x10, 0x01, 0x00, 0, 0, 0, 0];
+        nrmt_w.extend_from_slice(&(width as u32).to_be_bytes());
+        let mut nrmt_h = vec![0x01, 0x10, 0x01, 0x01, 0, 0, 0, 0];
+        nrmt_h.extend_from_slice(&(height as u32).to_be_bytes());
+        let mut nrfh_payload = Vec::new();
+        nrfh_payload.extend_from_slice(&box_wrap(b"NRHM", b"0100"));
+        nrfh_payload.extend_from_slice(&box_wrap(b"NRMT", &nrmt_w));
+        nrfh_payload.extend_from_slice(&box_wrap(b"NRMT", &nrmt_h));
+        let nrfh = box_wrap(b"NRFH", &nrfh_payload);
+
+        let mut nrti_payload = Vec::from(&b"0100"[..]);
+        nrti_payload.extend_from_slice(&(cs.len() as u32).to_be_bytes());
+        let nrth = box_wrap(b"NRTH", &box_wrap(b"NRTI", &nrti_payload));
+
+        let mut raw_sample = vec![0, 0, 0, 0, b'N', b'R', b'A', b'W'];
+        raw_sample.extend_from_slice(&nrfh);
+        raw_sample.extend_from_slice(&nrth);
+        raw_sample.extend_from_slice(&cs);
+        let slen = raw_sample.len() as u32;
+        raw_sample[..4].copy_from_slice(&slen.to_be_bytes());
+        let nf = bluecompress::nraw::NrawFrame::parse(&raw_sample).unwrap();
+        let sample = nf.build(&cs, Some((width as u32, height as u32))).unwrap();
+
+        // Build ISO BMFF container
+        let ftyp = box_wrap(b"ftyp", b"niko\x00\x00\x00\x00niko");
+        let mut tkhd = vec![0u8; 84];
+        tkhd[76..80].copy_from_slice(&((width as u32) << 16).to_be_bytes());
+        tkhd[80..84].copy_from_slice(&((height as u32) << 16).to_be_bytes());
+        let tkhd_box = box_wrap(b"tkhd", &tkhd);
+
+        let mut mdhd = vec![0u8; 24];
+        mdhd[12..16].copy_from_slice(&24000u32.to_be_bytes());
+        let mdhd_box = box_wrap(b"mdhd", &mdhd);
+
+        let mut hdlr = vec![0u8; 24];
+        hdlr[8..12].copy_from_slice(b"vide");
+        let hdlr_box = box_wrap(b"hdlr", &hdlr);
+
+        let mut stsd_entry = vec![0u8; 86];
+        stsd_entry[..4].copy_from_slice(&86u32.to_be_bytes());
+        stsd_entry[4..8].copy_from_slice(b"NRAW");
+        stsd_entry[32..34].copy_from_slice(&width.to_be_bytes());
+        stsd_entry[34..36].copy_from_slice(&height.to_be_bytes());
+        let mut stsd = vec![0u8; 8];
+        stsd[4..8].copy_from_slice(&1u32.to_be_bytes());
+        stsd.extend_from_slice(&stsd_entry);
+        let stsd_box = box_wrap(b"stsd", &stsd);
+
+        let mut stts = vec![0u8; 16];
+        stts[4..8].copy_from_slice(&1u32.to_be_bytes());
+        stts[8..12].copy_from_slice(&(nframes as u32).to_be_bytes());
+        stts[12..16].copy_from_slice(&1000u32.to_be_bytes());
+        let stts_box = box_wrap(b"stts", &stts);
+
+        let mut stsc = vec![0u8; 20];
+        stsc[4..8].copy_from_slice(&1u32.to_be_bytes());
+        stsc[8..12].copy_from_slice(&1u32.to_be_bytes());
+        stsc[12..16].copy_from_slice(&(nframes as u32).to_be_bytes());
+        stsc[16..20].copy_from_slice(&1u32.to_be_bytes());
+        let stsc_box = box_wrap(b"stsc", &stsc);
+
+        let mut stsz = vec![0u8; 12];
+        stsz[4..8].copy_from_slice(&(sample.len() as u32).to_be_bytes());
+        stsz[8..12].copy_from_slice(&(nframes as u32).to_be_bytes());
+        let stsz_box = box_wrap(b"stsz", &stsz);
+
+        // Placeholder co64 (patched once moov size is known)
+        let mut co64 = vec![0u8; 16];
+        co64[4..8].copy_from_slice(&1u32.to_be_bytes());
+        let co64_box = box_wrap(b"co64", &co64);
+
+        let build_moov = |mdat_payload_off: u64| -> Vec<u8> {
+            let mut co64 = vec![0u8; 16];
+            co64[4..8].copy_from_slice(&1u32.to_be_bytes());
+            co64[8..16].copy_from_slice(&mdat_payload_off.to_be_bytes());
+            let co64_box = box_wrap(b"co64", &co64);
+            let mut stbl_p = Vec::new();
+            for b in [&stsd_box, &stts_box, &stsc_box, &stsz_box, &co64_box] {
+                stbl_p.extend_from_slice(b);
+            }
+            let stbl = box_wrap(b"stbl", &stbl_p);
+            let minf = box_wrap(b"minf", &stbl);
+            let mut mdia_p = Vec::new();
+            mdia_p.extend_from_slice(&mdhd_box);
+            mdia_p.extend_from_slice(&hdlr_box);
+            mdia_p.extend_from_slice(&minf);
+            let mdia = box_wrap(b"mdia", &mdia_p);
+            let mut trak_p = Vec::new();
+            trak_p.extend_from_slice(&tkhd_box);
+            trak_p.extend_from_slice(&mdia);
+            let trak = box_wrap(b"trak", &trak_p);
+            box_wrap(b"moov", &trak)
+        };
+        let _ = co64_box;
+        let moov0 = build_moov(0);
+        let mdat_payload_off = (ftyp.len() + moov0.len() + 8) as u64;
+        let moov = build_moov(mdat_payload_off);
+
+        let mut mdat_payload = Vec::with_capacity(sample.len() * nframes);
+        for _ in 0..nframes {
+            mdat_payload.extend_from_slice(&sample);
+        }
+        let mdat = box_wrap(b"mdat", &mdat_payload);
+
+        let mut file_bytes = Vec::new();
+        file_bytes.extend_from_slice(&ftyp);
+        file_bytes.extend_from_slice(&moov);
+        file_bytes.extend_from_slice(&mdat);
+        std::fs::write(path, &file_bytes).unwrap();
+    }
+
+    #[test]
+    fn watch_and_serve_end_to_end() {
+        let base = std::env::temp_dir().join(format!("bluecomp_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let watch_in = base.join("watch_in");
+        let watch_out = base.join("watch_out");
+        let sub_in = watch_in.join("Day1").join("A001");
+        std::fs::create_dir_all(&sub_in).unwrap();
+        std::fs::create_dir_all(&watch_out).unwrap();
+
+        let clip_path = sub_in.join("CLIP_0001.NEV");
+        make_synthetic_nev(&clip_path, 128, 64, 2);
+
+        // Also place a corrupt clip to verify watch records it once and does not loop forever.
+        let bad_path = watch_in.join("CORRUPT.NEV");
+        std::fs::write(&bad_path, b"not a valid nev clip").unwrap();
+
+        // 1. Test watch --once (with 1s stability check).
+        let state = Arc::new(Mutex::new(watch::WatchSnapshot::default()));
+        let cancel = AtomicBool::new(false);
+        let rc = watch::run_watch(
+            watch::WatchConfig {
+                input_dir: watch_in.clone(),
+                output_dir: watch_out.clone(),
+                quality: 3,
+                resolution: Resolution::Original,
+                backend: Backend::Cpu,
+                threads: 2,
+                poll_seconds: 1,
+                json: false,
+                quiet: true,
+                once: true,
+            },
+            &cancel,
+            state.clone(),
+            None,
+            None,
+        );
+        // rc is 1 because CORRUPT.NEV failed while CLIP_0001.NEV succeeded.
+        assert_eq!(rc, 1);
+        let expected_out = watch_out.join("Day1").join("A001").join("CLIP_0001.NEV");
+        assert!(expected_out.is_file(), "watch output clip should exist at relative path");
+        let probed = bluecompress::probe(&expected_out).unwrap();
+        assert_eq!((probed.width, probed.height, probed.frames), (128, 64, 2));
+        let snap = state.lock().unwrap().clone();
+        assert_eq!(snap.done_count, 1);
+        assert_eq!(snap.failed_count, 1);
+
+        // 2. Test HTTP + SSE endpoints via serve.rs handler directly on an ephemeral port.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let media_dir = base.join("media");
+        std::fs::create_dir_all(&media_dir).unwrap();
+        let web_clip = media_dir.join("WEB_0001.NEV");
+        make_synthetic_nev(&web_clip, 128, 64, 2);
+
+        let serve_cfg = serve::ServeConfig {
+            listen: addr.to_string(),
+            browse_root: base.clone(),
+            initial_paths: vec![],
+            default_backend: Backend::Cpu,
+            threads: 2,
+            watch: None,
+        };
+        std::thread::spawn(move || {
+            serve::run_serve(serve_cfg, &CANCEL);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(120));
+
+        let http_req = |method: &str, path: &str, body: &str| -> (u16, Vec<u8>) {
+            let mut s = TcpStream::connect(addr).unwrap();
+            let req = format!(
+                "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            s.write_all(req.as_bytes()).unwrap();
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).unwrap();
+            let sep = resp.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+            let head = String::from_utf8_lossy(&resp[..sep]);
+            let status: u16 = head.lines().next().unwrap().split_whitespace().nth(1).unwrap().parse().unwrap();
+            (status, resp[sep + 4..].to_vec())
+        };
+
+        let (st, html) = http_req("GET", "/", "");
+        assert_eq!(st, 200);
+        assert!(String::from_utf8_lossy(&html).contains("Blue Compressor"));
+
+        let (st, info_bytes) = http_req("POST", "/api/invoke/app_info", "{}");
+        assert_eq!(st, 200);
+        let info_val: serde_json::Value = serde_json::from_slice(&info_bytes).unwrap();
+        assert_eq!(info_val["web"], serde_json::Value::Bool(true));
+
+        let (st, list_bytes) = http_req("GET", &format!("/api/fs/list?path={}", media_dir.display()), "");
+        assert_eq!(st, 200);
+        let list_val: serde_json::Value = serde_json::from_slice(&list_bytes).unwrap();
+        assert_eq!(list_val["entries"][0]["name"], "WEB_0001.NEV");
+
+        let mkdir_body = serde_json::json!({ "parent": media_dir.to_string_lossy(), "name": "Out" }).to_string();
+        let (st, _) = http_req("POST", "/api/fs/mkdir", &mkdir_body);
+        assert_eq!(st, 200);
+        assert!(media_dir.join("Out").is_dir());
+
+        let scan_body = serde_json::json!({ "paths": [media_dir.to_string_lossy()] }).to_string();
+        let (st, scan_bytes) = http_req("POST", "/api/invoke/scan", &scan_body);
+        assert_eq!(st, 200);
+        let scan_val: serde_json::Value = serde_json::from_slice(&scan_bytes).unwrap();
+        assert_eq!(scan_val[0]["ok"], serde_json::Value::Bool(true));
+        assert_eq!(scan_val[0]["width"], 128);
+
+        let thumb_body = serde_json::json!({ "path": web_clip.to_string_lossy(), "width": 32 }).to_string();
+        let (st, thumb_bytes) = http_req("POST", "/api/invoke/thumbnail", &thumb_body);
+        assert_eq!(st, 200);
+        assert!(thumb_bytes.len() > 8);
+
+        let prev_body = serde_json::json!({
+            "path": web_clip.to_string_lossy(),
+            "frame": 0,
+            "quality": 2,
+            "resolution": "original",
+            "backend": "cpu",
+            "width": 32
+        })
+        .to_string();
+        let (st, prev_bytes) = http_req("POST", "/api/invoke/preview", &prev_body);
+        assert_eq!(st, 200);
+        assert!(prev_bytes.len() > 32);
+
+        // Open SSE stream, start a job, and verify job-done + queue-finished events arrive.
+        let mut sse = TcpStream::connect(addr).unwrap();
+        sse.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        sse.write_all(format!("GET /api/events HTTP/1.1\r\nHost: {addr}\r\n\r\n").as_bytes()).unwrap();
+        let mut sse_reader = BufReader::new(sse);
+
+        let start_body = serde_json::json!({
+            "jobs": [{ "id": 1, "path": web_clip.to_string_lossy(), "quality": 2, "resolution": "original" }],
+            "settings": { "backend": "cpu", "outputFolder": media_dir.join("Out").to_string_lossy() }
+        })
+        .to_string();
+        let (st, _) = http_req("POST", "/api/invoke/start", &start_body);
+        assert_eq!(st, 200);
+
+        let mut saw_done = false;
+        let mut saw_finished = false;
+        let mut line = String::new();
+        while sse_reader.read_line(&mut line).unwrap_or(0) > 0 {
+            if let Some(json_str) = line.trim().strip_prefix("data: ") {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+                    if v["event"] == "job-done" {
+                        saw_done = true;
+                    }
+                    if v["event"] == "queue-finished" {
+                        saw_finished = true;
+                        break;
+                    }
+                }
+            }
+            line.clear();
+        }
+        assert!(saw_done && saw_finished, "SSE stream should emit job-done and queue-finished");
+        assert!(media_dir.join("Out").join("WEB_0001.NEV").is_file());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

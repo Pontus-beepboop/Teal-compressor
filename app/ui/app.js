@@ -2,14 +2,16 @@
 "use strict";
 
 const T = window.__TAURI__;
+const WEB = !T && location.protocol.startsWith("http") && location.hash !== "#demo";
 const $ = (id) => document.getElementById(id);
 
-// Outside Tauri (a plain browser), a small stand-in keeps the page usable for design work.
+// Outside Tauri: talk to the `bluecompress serve` HTTP/SSE backend when served over HTTP,
+// or fall back to the offline stand-in when opened from a file:// URL or with #demo.
 const api = T ? {
   invoke: (cmd, args) => T.core.invoke(cmd, args),
   listen: (ev, fn) => T.event.listen(ev, (e) => fn(e.payload)),
   onDragDrop: (fn) => T.webview.getCurrentWebview().onDragDropEvent((e) => fn(e.payload)),
-} : browserStandIn();
+} : WEB ? webApi() : browserStandIn();
 
 const QUALITY = {
   1: { title: "Lossless", saving: "4 to 10% smaller", keep: 0.93,
@@ -541,6 +543,54 @@ function onEvents() {
   });
   api.listen("open-paths", (paths) => addPaths(paths));
   api.listen("quit-requested", () => $("quit-modal").classList.add("show"));
+  api.listen("watch-status", (w) => renderWatch(w));
+}
+
+function renderWatch(w) {
+  const chip = $("watch-chip"), sec = $("watch-section");
+  if (!chip || !sec) return;
+  if (!w || !w.enabled) {
+    chip.hidden = true;
+    sec.hidden = true;
+    return;
+  }
+  chip.hidden = false;
+  sec.hidden = false;
+  const dot = $("watch-dot"), pill = $("watch-pill"), meter = $("watch-meter"), fill = $("watch-meter-fill");
+  const q = QUALITY[w.quality] ? w.quality : 3;
+  const res = w.resolution || "original";
+  $("watch-preset").textContent = settingLabel(q, res);
+  $("watch-dirs").textContent = `${w.inputDir} → ${w.outputDir}`;
+  $("watch-dirs").title = `Input: ${w.inputDir}
+Output: ${w.outputDir}`;
+  dot.className = `chip-dot ${w.state || "idle"}`;
+  if (w.state === "running" && w.currentClip) {
+    const pct = Math.floor((w.fraction || 0) * 100);
+    $("watch-chip-text").textContent = `Watch: ${w.currentClip} (${pct}%)`;
+    pill.textContent = `${pct}%`;
+    pill.className = "job-pill running";
+    $("watch-stats").textContent = `${w.currentClip}${w.fps > 0 ? " · " + fpsText(w.fps) + " fps" : ""}`;
+    meter.hidden = false;
+    fill.style.width = `${(w.fraction || 0) * 100}%`;
+  } else if (w.state === "stabilizing") {
+    $("watch-chip-text").textContent = "Watch: waiting for copy";
+    pill.textContent = "Copying";
+    pill.className = "job-pill waiting";
+    $("watch-stats").textContent = "Waiting for incoming file copy to finish";
+    meter.hidden = true;
+  } else {
+    $("watch-chip-text").textContent = w.doneCount ? `Watch: ${w.doneCount} done` : `Watch: ${w.inputDir}`;
+    pill.textContent = "Watching";
+    pill.className = "job-pill done";
+    if (w.lastError) {
+      $("watch-stats").textContent = `Last error: ${w.lastError}`;
+    } else if (w.doneCount > 0) {
+      $("watch-stats").textContent = `${w.doneCount} done · ${gb(w.savedInputBytes || 0)} → ${gb(w.savedOutputBytes || 0)}`;
+    } else {
+      $("watch-stats").textContent = `Polling every ${w.pollSeconds || 5}s for .NEV and .R3D clips`;
+    }
+    meter.hidden = true;
+  }
 }
 
 // Quality previewer ------------------------------------------------------------
@@ -1117,6 +1167,11 @@ async function init() {
   info = await api.invoke("app_info");
   info.gpuAvailable = !!info.gpu && !/^(CPU|not available)/i.test(info.gpu);
   document.body.classList.add(info.platform);
+  if (info.web) {
+    document.body.classList.add("web");
+    if ($("drop-title")) $("drop-title").textContent = "Choose clips or folders on this server";
+    if (info.watch) renderWatch(info.watch);
+  }
   bindSeg("seg-resolution", "resolution");
   bindSeg("seg-quality", "quality", Number);
   bindSeg("seg-backend", "backend");
@@ -1264,6 +1319,279 @@ function browserStandIn() {
         }
         default: return null;
       }
+    },
+  };
+}
+
+// Web UI backend (`bluecompress serve`): HTTP command calls, SSE events, and NAS file browser.
+function webApi() {
+  const handlers = {};
+  const emit = (ev, p) => (handlers[ev] || []).forEach((f) => f(p));
+
+  const connectEvents = () => {
+    const es = new EventSource("/api/events");
+    es.onmessage = (e) => {
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg && msg.event) emit(msg.event, msg.payload);
+      } catch { /* ignore */ }
+    };
+  };
+  connectEvents();
+
+  let lastDir = "";
+  try { lastDir = localStorage.getItem("webLastDir") || ""; } catch { /* ignore */ }
+  const saveLastDir = (d) => {
+    lastDir = d;
+    try { localStorage.setItem("webLastDir", d); } catch { /* ignore */ }
+  };
+
+  let fsResolve = null;
+  let fsState = { mode: "clips", path: "", parent: null, entries: [], selected: new Set() };
+  let fsBound = false;
+
+  async function fetchDir(path) {
+    const q = path ? `?path=${encodeURIComponent(path)}` : "";
+    const r = await fetch(`/api/fs/list${q}`);
+    if (!r.ok) throw new Error(await r.text());
+    return r.json();
+  }
+
+  function closeFs(val) {
+    $("fs-modal").classList.remove("show");
+    $("fs-mkdir-row").hidden = true;
+    $("fs-error").hidden = true;
+    const fn = fsResolve;
+    fsResolve = null;
+    if (fn) fn(val);
+  }
+
+  function showFsError(msg) {
+    const el = $("fs-error");
+    if (!msg) { el.hidden = true; el.textContent = ""; return; }
+    el.textContent = msg;
+    el.hidden = false;
+  }
+
+  function renderFs() {
+    $("fs-path-input").value = fsState.path;
+    $("fs-up").disabled = !fsState.parent;
+
+    const rootsEl = $("fs-roots");
+    rootsEl.innerHTML = "";
+    for (const r of fsState.roots || []) {
+      const b = document.createElement("button");
+      b.className = `fs-root-btn${fsState.path === r ? " active" : ""}`;
+      b.textContent = r;
+      b.addEventListener("click", () => loadDir(r));
+      rootsEl.append(b);
+    }
+
+    const clipsInDir = fsState.entries.filter((e) => e.kind === "clip");
+    const selAllBtn = $("fs-select-all");
+    selAllBtn.hidden = !(fsState.mode === "clips" && clipsInDir.length > 0);
+    if (!selAllBtn.hidden) {
+      const allSelected = clipsInDir.every((c) => fsState.selected.has(c.path));
+      selAllBtn.textContent = allSelected ? "Clear Selection" : `Select All Clips (${clipsInDir.length})`;
+    }
+
+    $("fs-mkdir-toggle").hidden = fsState.mode !== "output";
+    $("fs-add-current-dir").hidden = fsState.mode !== "clips";
+
+    const listEl = $("fs-list");
+    listEl.innerHTML = "";
+    if (!fsState.entries.length) {
+      const empty = document.createElement("div");
+      empty.className = "fs-empty";
+      empty.textContent = "No subfolders or .NEV / .R3D clips in this folder";
+      listEl.append(empty);
+    } else {
+      for (const item of fsState.entries) {
+        const row = document.createElement("div");
+        const isSel = fsState.selected.has(item.path);
+        row.className = `fs-row ${item.kind}${isSel ? " selected" : ""}`;
+        if (item.kind === "dir") {
+          row.innerHTML = `<svg viewBox="0 0 16 16" class="fs-row-ico"><path d="M1.8 4.2c0-.7.5-1.2 1.2-1.2h3l1.4 1.6h5.6c.7 0 1.2.5 1.2 1.2v6.2c0 .7-.5 1.2-1.2 1.2H3c-.7 0-1.2-.5-1.2-1.2V4.2Z"/></svg>` +
+            `<span class="fs-row-name">${esc(item.name)}</span>`;
+          if (fsState.mode === "clips" || fsState.mode === "input-folder") {
+            const addBtn = document.createElement("button");
+            addBtn.className = "link-btn";
+            addBtn.textContent = "Add Folder";
+            addBtn.addEventListener("click", (e) => {
+              e.stopPropagation();
+              closeFs(fsState.mode === "clips" ? [item.path] : item.path);
+            });
+            row.append(addBtn);
+          }
+          row.addEventListener("click", () => loadDir(item.path));
+        } else {
+          row.innerHTML = `<svg viewBox="0 0 16 16" class="fs-row-ico"><path d="M3 2.5h7l3 3v8H3z"/></svg>` +
+            `<span class="fs-row-name">${esc(item.name)}</span>` +
+            (item.codec ? `<span class="fs-row-badge">${esc(item.codec)}</span>` : "") +
+            `<span class="fs-row-meta">${gb(item.size)}</span>`;
+          if (fsState.mode === "clips") {
+            row.addEventListener("click", () => {
+              if (fsState.selected.has(item.path)) fsState.selected.delete(item.path);
+              else fsState.selected.add(item.path);
+              renderFs();
+            });
+            row.addEventListener("dblclick", () => closeFs([item.path]));
+          } else {
+            row.style.opacity = "0.65";
+          }
+        }
+        listEl.append(row);
+      }
+    }
+
+    const n = fsState.selected.size;
+    if (fsState.mode === "clips") {
+      $("fs-summary").textContent = n ? `${n} clip${n === 1 ? "" : "s"} selected` : `Folder: ${fsState.path}`;
+      $("fs-confirm").textContent = n ? `Add ${n} Clip${n === 1 ? "" : "s"}` : "Add Folder";
+      $("fs-confirm").disabled = !fsState.path;
+    } else if (fsState.mode === "input-folder") {
+      $("fs-summary").textContent = fsState.path;
+      $("fs-confirm").textContent = "Add This Folder";
+      $("fs-confirm").disabled = !fsState.path;
+    } else if (fsState.mode === "output") {
+      $("fs-summary").textContent = fsState.path;
+      $("fs-confirm").textContent = "Select Output Folder";
+      $("fs-confirm").disabled = !fsState.path;
+    } else {
+      $("fs-summary").textContent = fsState.path;
+      $("fs-confirm").textContent = "Done";
+      $("fs-confirm").disabled = false;
+    }
+  }
+
+  async function loadDir(targetPath, highlightFile) {
+    showFsError("");
+    try {
+      const data = await fetchDir(targetPath);
+      fsState.path = data.path;
+      fsState.parent = data.parent;
+      fsState.roots = data.roots || [];
+      fsState.entries = data.entries || [];
+      fsState.selected.clear();
+      if (highlightFile) fsState.selected.add(highlightFile);
+      saveLastDir(data.path);
+      renderFs();
+    } catch (e) {
+      showFsError(e.message || String(e));
+    }
+  }
+
+  function bindFsOnce() {
+    if (fsBound) return;
+    fsBound = true;
+    $("fs-close").addEventListener("click", () => closeFs(fsState.mode === "clips" ? [] : null));
+    $("fs-cancel").addEventListener("click", () => closeFs(fsState.mode === "clips" ? [] : null));
+    $("fs-up").addEventListener("click", () => { if (fsState.parent) loadDir(fsState.parent); });
+    $("fs-go").addEventListener("click", () => loadDir($("fs-path-input").value.trim()));
+    $("fs-path-input").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); loadDir($("fs-path-input").value.trim()); }
+    });
+    $("fs-select-all").addEventListener("click", () => {
+      const clips = fsState.entries.filter((e) => e.kind === "clip");
+      const allSelected = clips.every((c) => fsState.selected.has(c.path));
+      if (allSelected) fsState.selected.clear();
+      else for (const c of clips) fsState.selected.add(c.path);
+      renderFs();
+    });
+    $("fs-mkdir-toggle").addEventListener("click", () => {
+      const row = $("fs-mkdir-row");
+      row.hidden = !row.hidden;
+      if (!row.hidden) { $("fs-mkdir-input").value = ""; $("fs-mkdir-input").focus(); }
+    });
+    $("fs-mkdir-cancel").addEventListener("click", () => { $("fs-mkdir-row").hidden = true; });
+    const doMkdir = async () => {
+      const name = $("fs-mkdir-input").value.trim();
+      if (!name) return;
+      try {
+        const r = await fetch("/api/fs/mkdir", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ parent: fsState.path, name }),
+        });
+        if (!r.ok) throw new Error(await r.text());
+        const res = await r.json();
+        $("fs-mkdir-row").hidden = true;
+        await loadDir(res.path);
+      } catch (e) {
+        showFsError(e.message || String(e));
+      }
+    };
+    $("fs-mkdir-create").addEventListener("click", doMkdir);
+    $("fs-mkdir-input").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); doMkdir(); }
+    });
+    $("fs-add-current-dir").addEventListener("click", () => {
+      if (fsState.path) closeFs([fsState.path]);
+    });
+    $("fs-confirm").addEventListener("click", () => {
+      if (fsState.mode === "clips") {
+        closeFs(fsState.selected.size ? Array.from(fsState.selected) : fsState.path ? [fsState.path] : []);
+      } else if (fsState.mode === "reveal") {
+        closeFs(null);
+      } else {
+        closeFs(fsState.path || null);
+      }
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && $("fs-modal").classList.contains("show")) {
+        closeFs(fsState.mode === "clips" ? [] : null);
+      }
+    });
+  }
+
+  function openFsModal(mode, title, sub, initialPath, highlightFile) {
+    bindFsOnce();
+    fsState.mode = mode;
+    fsState.selected.clear();
+    $("fs-title").textContent = title;
+    $("fs-sub").textContent = sub;
+    $("fs-mkdir-row").hidden = true;
+    $("fs-error").hidden = true;
+    $("fs-modal").classList.add("show");
+    loadDir(initialPath || lastDir || "", highlightFile);
+    return new Promise((resolve) => { fsResolve = resolve; });
+  }
+
+  return {
+    listen: (ev, fn) => { (handlers[ev] ||= []).push(fn); },
+    onDragDrop: () => {},
+    invoke: async (cmd, a = {}) => {
+      if (cmd === "pick_clips") {
+        return openFsModal(
+          "clips",
+          "Add Clips",
+          "Select one or more .NEV / .R3D clips, or add a whole folder",
+          lastDir
+        );
+      }
+      if (cmd === "pick_folder") {
+        const isOutput = a && a.title && /save|output/i.test(a.title);
+        return openFsModal(
+          isOutput ? "output" : "input-folder",
+          (a && a.title) || "Choose Folder",
+          isOutput ? "Choose where compressed clips should be saved" : "Subfolders are scanned recursively for .NEV and .R3D clips",
+          isOutput && settings.outputFolder ? settings.outputFolder : lastDir
+        );
+      }
+      if (cmd === "reveal") {
+        const p = (a && a.path) || "";
+        const slash = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"));
+        const dir = slash > 0 ? p.slice(0, slash) : "/";
+        return openFsModal("reveal", "Clip Location", p, dir, p);
+      }
+      const r = await fetch(`/api/invoke/${cmd}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(a || {}),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      if (cmd === "preview" || cmd === "thumbnail") return r.arrayBuffer();
+      return r.json();
     },
   };
 }

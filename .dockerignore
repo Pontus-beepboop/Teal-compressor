@@ -1,0 +1,16 @@
+target/
+dist/
+.git/
+.github/
+*.dmg
+*.exe
+*.msi
+*.AppImage
+*.deb
+*.rpm
+*.NEV
+*.R3D
+*.nev
+*.r3d
+*.partial
+*.tmp

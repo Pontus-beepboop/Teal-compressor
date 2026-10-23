@@ -922,3 +922,133 @@ body.per-clip .job-settings { display: flex; }
 .job.done .job-settings, .job.failed .job-settings, .job.cancelled .job-settings { display: none; }
 .seg.inactive button.active { background: transparent; box-shadow: 0 0 0 1px var(--border) inset; color: var(--text-2); }
 .seg.inactive { opacity: 0.6; }
+
+/* Watch folder status and Web UI server file browser ----------------------- */
+
+.chip-dot.running { background: var(--accent-2); }
+.chip-dot.stabilizing { background: var(--warn); }
+
+.watch-card {
+  padding: 11px 13px;
+  border-radius: var(--radius);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.watch-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.watch-preset { font-weight: 600; font-size: 12.5px; }
+.watch-dirs { font-family: var(--mono); font-size: 11px; color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.watch-stats { font-size: 11.5px; color: var(--text-3); font-variant-numeric: tabular-nums; }
+.watch-meter { margin-top: 2px; }
+
+#fs-modal .fs-card {
+  width: min(720px, calc(100vw - 36px));
+  max-height: calc(100vh - 48px);
+  padding: 18px 20px 16px;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.fs-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.fs-head h3 { margin: 0; font-size: 15.5px; font-weight: 650; }
+.fs-sub { color: var(--text-3); font-size: 12px; margin-top: 2px; }
+.fs-roots { display: flex; flex-wrap: wrap; gap: 6px; }
+.fs-roots:empty { display: none; }
+.fs-root-btn {
+  height: 24px;
+  padding: 0 9px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-family: var(--mono);
+  font-size: 11px;
+  cursor: pointer;
+}
+.fs-root-btn:hover, .fs-root-btn.active { border-color: var(--accent-ring); color: var(--text); background: var(--accent-soft); }
+.fs-nav, .fs-mkdir-row { display: flex; gap: 6px; align-items: center; }
+.fs-nav[hidden], .fs-mkdir-row[hidden], .fs-error[hidden], .btn[hidden], .chip[hidden], section[hidden] { display: none !important; }
+.fs-input {
+  flex: 1;
+  min-width: 0;
+  height: 30px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.fs-input:focus { outline: none; border-color: var(--accent-ring); box-shadow: 0 0 0 2px var(--accent-soft); }
+.fs-error {
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: var(--err-soft);
+  color: var(--err);
+  font-size: 12px;
+}
+.fs-list {
+  flex: 1;
+  min-height: 240px;
+  max-height: 380px;
+  overflow-y: auto;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.fs-empty {
+  padding: 42px 20px;
+  text-align: center;
+  color: var(--text-3);
+  font-size: 12.5px;
+}
+.fs-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: 7px;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+.fs-row:hover { background: var(--surface-hover); }
+.fs-row.selected { background: var(--accent-soft); border-color: var(--accent-ring); }
+.fs-row-ico { width: 16px; height: 16px; color: var(--text-3); flex: none; }
+.fs-row.dir .fs-row-ico { color: var(--accent-2); }
+.fs-row-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 550; }
+.fs-row-badge {
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 650;
+  background: var(--seg-bg);
+  color: var(--text-2);
+  flex: none;
+}
+.fs-row-meta { color: var(--text-3); font-size: 11.5px; font-variant-numeric: tabular-nums; flex: none; }
+.fs-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 4px;
+}
+.fs-summary {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-2);
+  font-size: 12px;
+  font-family: var(--mono);
+}
+.fs-buttons { display: flex; gap: 8px; flex: none; }
