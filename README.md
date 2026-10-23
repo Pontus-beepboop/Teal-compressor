@@ -94,8 +94,9 @@ GPU backends:
   NVRTC is not part of the NVIDIA driver and has to be installed separately. On Windows it
   must be NVRTC **12.x** (`nvrtc64_120_0.dll` plus its `nvrtc-builtins64_12*.dll`), next to
   `bluecompress.exe` or on `PATH`; NVRTC 13 (`nvrtc64_130_0.dll`) is not picked up.
-  **It is untested**: it was written without access to an NVIDIA GPU. Compare its
-  output against `--backend cpu` before relying on it, and please report results.
+  Verified on Windows 11 with an RTX 4060 Ti; Linux and other NVIDIA GPUs are not yet
+  tested. Compare its output against `--backend cpu` before relying on it, and please
+  report results.
 
 ### Desktop app
 
