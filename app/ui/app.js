@@ -1,4 +1,5 @@
 // Blue Compressor UI. The queue lives here; the Rust side scans, probes, previews and runs jobs.
+// In the web UI the server also keeps the submitted queue, so a reload can restore it.
 "use strict";
 
 const T = window.__TAURI__;
@@ -44,6 +45,7 @@ const settings = Object.assign(
 let jobs = [];
 let nextId = 1;
 let running = false;
+let paused = false;
 let info = { gpu: "", cpu: "", platform: "" };
 const els = new Map(); // job id -> card element
 
@@ -171,22 +173,28 @@ function backendNote() {
 
 // Queue ------------------------------------------------------------------------
 
+// In the web UI clips can be added while the queue runs; they are handed to the server
+// at once and compressed after the current ones.
+const canAdd = () => !running || WEB;
+
 async function addPaths(paths) {
-  if (!paths || !paths.length || running) return;
+  if (!paths || !paths.length || !canAdd()) return;
   const clips = await api.invoke("scan", { paths });
-  const known = new Set(jobs.filter((j) => j.state === "waiting").map((j) => j.path));
-  let added = 0;
+  const known = new Set(jobs.filter((j) => j.state === "waiting" || j.state === "running").map((j) => j.path));
+  const fresh = [];
   for (const c of clips) {
     if (known.has(c.path)) continue;
     known.add(c.path);
-    jobs.push({
+    const j = {
       ...c, id: nextId++, state: c.ok ? "waiting" : "failed", fraction: 0, rate: 0, target: null,
       quality: settings.quality, resolution: settings.resolution,
-    });
-    added++;
+    };
+    jobs.push(j);
+    fresh.push(j);
   }
-  if (added) {
+  if (fresh.length) {
     await planTargets();
+    if (running && WEB) await enqueue(fresh.filter((j) => j.ok && j.state === "waiting"));
     renderAll();
     loadThumbs();
   }
@@ -205,6 +213,7 @@ async function again(id) {
   }
   const copy = {
     ...j, id: nextId++, state: "waiting", fraction: 0, rate: 0, result: null, output: null, ran: null, inRun: false,
+    onServer: false, force: true,
     quality: j.ran ? j.ran.quality : j.quality, resolution: j.ran ? j.ran.resolution : j.resolution,
   };
   copy.target = await targetFor(copy, resolutionOf(copy));
@@ -291,7 +300,8 @@ function jobCard(j) {
 
 function updateCard(j) {
   const el = jobCard(j);
-  el.className = `job ${j.state}${viewer.job && viewer.job.id === j.id ? " selected" : ""}`;
+  const isPaused = paused && j.state === "running";
+  el.className = `job ${j.state}${isPaused ? " paused" : ""}${viewer.job && viewer.job.id === j.id ? " selected" : ""}`;
   const thumb = el.querySelector(".job-thumb");
   thumb.className = `job-thumb${j.codec === "R3D NE" ? " r3d" : ""}${j.ok ? "" : " bad"}`;
   el.querySelector(".job-codec").textContent = j.ok ? j.codec : "?";
@@ -301,8 +311,9 @@ function updateCard(j) {
 
   const pill = el.querySelector(".job-pill");
   const pills = { waiting: "Waiting", running: "Compressing", done: "Done", failed: "Failed", cancelled: "Cancelled" };
-  pill.textContent = j.state === "failed" && !j.ok ? "Unreadable" : pills[j.state];
-  pill.className = `job-pill ${j.state}`;
+  const skipped = j.state === "done" && j.result && j.result.skipped;
+  pill.textContent = j.state === "failed" && !j.ok ? "Unreadable" : isPaused ? "Paused" : skipped ? "Already done" : pills[j.state];
+  pill.className = `job-pill ${isPaused ? "paused" : j.state}`;
 
   const meta = el.querySelector(".job-meta");
   if (!j.ok || (j.state === "failed" && j.error)) {
@@ -335,6 +346,7 @@ function updateCard(j) {
       ? "Add this clip to the queue again, to make another version with different settings"
       : "Put this clip back in the queue";
     againBtn.disabled = running;
+    if (skipped) againBtn.title = "A compressed copy was already there, so this clip was skipped. Add it again to make a new version.";
   }
 
   const qSel = el.querySelector(".job-q"), rSel = el.querySelector(".job-r");
@@ -349,8 +361,14 @@ function updateCard(j) {
   if (j.state === "running") {
     stat.textContent = `${Math.floor(j.fraction * 100)}%`;
     const left = j.rate > 0 ? (1 - j.fraction) * j.frames / j.rate : NaN;
-    sub.textContent = j.rate > 0 ? `${fpsText(j.rate)} fps · ${clock(left)} left` : "Starting";
+    sub.textContent = isPaused ? "Paused" : j.rate > 0 ? `${fpsText(j.rate)} fps · ${clock(left)} left` : "Starting";
     fill.style.width = `${j.fraction * 100}%`;
+  } else if (skipped) {
+    const r = j.result;
+    stat.textContent = gb(r.outputBytes);
+    sub.textContent = "Already compressed, skipped";
+    sub.title = `A compressed copy already exists at ${r.output}`;
+    fill.style.width = "100%";
   } else if (j.state === "done") {
     const r = j.result;
     const saved = 1 - r.outputBytes / Math.max(1, r.inputBytes);
@@ -380,7 +398,7 @@ function updateCard(j) {
   el.querySelector(".job-reveal").hidden = !(j.state === "done" || j.ok);
   el.querySelector(".job-reveal").title = j.state === "done" ? `${revealLabel()} (compressed copy)` : revealLabel();
   el.querySelector(".job-preview").hidden = !j.ok;
-  el.querySelector(".job-remove").hidden = running;
+  el.querySelector(".job-remove").hidden = running && !(WEB && j.state !== "running");
 }
 
 function revealLabel() {
@@ -400,23 +418,38 @@ function estimateBytes(j) {
   return { bytes: j.bytes * QUALITY[q].keep * areaRatio(j, j.target), measured: false };
 }
 
+function dropJobs(gone) {
+  if (!gone.length) return;
+  const ids = new Set(gone.map((j) => j.id));
+  if (viewer.job && ids.has(viewer.job.id)) closeViewer();
+  for (const id of ids) {
+    const el = els.get(id);
+    if (el) el.remove();
+    els.delete(id);
+  }
+  jobs = jobs.filter((j) => !ids.has(j.id));
+}
+
 function removeJob(id) {
-  if (running) return;
-  if (viewer.job && viewer.job.id === id) closeViewer();
-  jobs = jobs.filter((j) => j.id !== id);
-  const el = els.get(id);
-  if (el) { el.remove(); els.delete(id); }
+  const j = jobs.find((x) => x.id === id);
+  if (!j || j.state === "running" || (running && !WEB)) return;
+  dropJobs([j]);
+  if (WEB && j.onServer) api.invoke("remove_jobs", { ids: [id] }).catch(() => {});
   renderAll();
 }
 
-function clearFinished() {
-  if (running) return;
-  for (const j of jobs.filter((x) => x.state !== "waiting")) {
-    const el = els.get(j.id);
-    if (el) el.remove();
-    els.delete(j.id);
+const isFinished = (j) => j.state !== "waiting" && j.state !== "running";
+
+// Clear List: with nothing running, empties the whole queue. While compressing, the clip
+// being compressed and the ones still waiting for it stay; everything finished goes.
+function clearList() {
+  if (running) {
+    dropJobs(jobs.filter(isFinished));
+    if (WEB) api.invoke("remove_jobs", {}).catch(() => {});
+  } else {
+    dropJobs(jobs.slice());
+    if (WEB) api.invoke("remove_jobs", { all: true }).catch(() => {});
   }
-  jobs = jobs.filter((j) => j.state === "waiting");
   renderAll();
 }
 
@@ -443,8 +476,19 @@ function renderFooter() {
   const done = jobs.filter((j) => j.state === "done");
   const total = ok.reduce((s, j) => s + j.bytes, 0);
   $("queue-meta").textContent = jobs.length ? `${jobs.length} clip${jobs.length === 1 ? "" : "s"} · ${gb(total)}` : "";
-  $("btn-clear").disabled = running || !jobs.some((j) => j.state !== "waiting");
-  $("btn-add").disabled = $("btn-add-folder").disabled = running;
+  const clear = $("btn-clear");
+  clear.disabled = running ? !jobs.some(isFinished) : jobs.length === 0;
+  clear.title = running
+    ? "Removes finished clips. The clip being compressed and the waiting ones stay until the queue is done or stopped."
+    : "Removes every clip from the list. Compressed files are kept.";
+  $("btn-add").disabled = $("btn-add-folder").disabled = !canAdd();
+  const pause = $("btn-pause");
+  pause.hidden = !running;
+  $("pause-label").textContent = paused ? "Resume" : "Pause";
+  $("pause-icon").innerHTML = paused
+    ? '<path d="M4.5 3.2v9.6L12.5 8 4.5 3.2Z" class="fill"/>'
+    : '<rect x="4" y="3.5" width="2.6" height="9" rx="0.8" class="fill"/><rect x="9.4" y="3.5" width="2.6" height="9" rx="0.8" class="fill"/>';
+  pause.title = paused ? "Continue compressing" : "Pause the queue. The current clip pauses where it is and continues on Resume.";
 
   const go = $("btn-go");
   go.classList.toggle("stop", running);
@@ -464,8 +508,12 @@ function renderFooter() {
     const cur = jobs.find((j) => j.state === "running");
     const idx = active.indexOf(cur) + 1;
     const fps = cur ? cur.rate : 0;
-    main.textContent = cur ? `Compressing ${idx} of ${active.length}` : "Preparing";
-    sub.textContent = fps > 0 ? `${fpsText(fps)} fps · about ${clock((frames - doneFrames) / fps)} left for the queue` : cur ? cur.name : "";
+    main.textContent = paused
+      ? (cur ? `Paused at ${idx} of ${active.length}` : "Paused")
+      : cur ? `Compressing ${idx} of ${active.length}` : "Preparing";
+    sub.textContent = paused
+      ? (cur ? `${cur.name} · ${Math.floor(cur.fraction * 100)}%` : "Resume to continue with the next clip")
+      : fps > 0 ? `${fpsText(fps)} fps · about ${clock((frames - doneFrames) / fps)} left for the queue` : cur ? cur.name : "";
     fill.style.width = frames ? `${(doneFrames / frames) * 100}%` : "0";
   } else if (done.length) {
     const pct = (1 - savedOut / Math.max(1, savedIn)) * 100;
@@ -491,26 +539,102 @@ function renderFooter() {
 
 // Running ----------------------------------------------------------------------
 
+const jobRequest = (j) => ({
+  id: j.id, path: j.path, quality: j.ran.quality, resolution: j.ran.resolution, force: !!j.force,
+  clip: { name: j.name, codec: j.codec, width: j.width, height: j.height, frames: j.frames, fps: j.fps, bytes: j.bytes },
+});
+const runSettings = () => ({ backend: settings.backend, outputFolder: settings.dest === "custom" ? settings.outputFolder : null });
+
 async function start() {
   const todo = jobs.filter((j) => j.ok && j.state === "waiting");
   if (!todo.length) return;
   for (const j of jobs) j.inRun = todo.includes(j);
-  for (const j of todo) j.ran = { quality: qualityOf(j), resolution: resolutionOf(j) };
+  for (const j of todo) { j.ran = { quality: qualityOf(j), resolution: resolutionOf(j) }; j.onServer = WEB; }
   running = true;
+  paused = false;
   if (viewer.open) closeViewer();
   renderAll();
   try {
-    await api.invoke("start", {
-      jobs: todo.map((j) => ({ id: j.id, path: j.path, quality: j.ran.quality, resolution: j.ran.resolution })),
-      settings: { backend: settings.backend, outputFolder: settings.dest === "custom" ? settings.outputFolder : null },
-    });
+    await api.invoke("start", { jobs: todo.map(jobRequest), settings: runSettings() });
   } catch (e) {
     running = false;
     renderAll();
   }
 }
 
+// Web UI only: hands clips added during a run to the server, behind the running ones.
+async function enqueue(todo) {
+  if (!todo.length) return;
+  for (const j of todo) { j.ran = { quality: qualityOf(j), resolution: resolutionOf(j) }; j.inRun = true; j.onServer = true; }
+  try {
+    await api.invoke("start", { jobs: todo.map(jobRequest), settings: runSettings() });
+  } catch { for (const j of todo) { j.inRun = false; j.onServer = false; } }
+}
+
 function stop() { api.invoke("cancel"); }
+
+async function togglePause() {
+  if (!running) return;
+  const want = !paused;
+  paused = want;
+  renderAll();
+  try {
+    const r = await api.invoke("set_paused", { paused: want });
+    if (r && typeof r.paused === "boolean") paused = r.paused;
+  } catch { paused = !want; }
+  renderAll();
+}
+
+// Web UI: rebuilds the list from the server's queue, so a reloaded page (or another tab)
+// shows the same clips, progress and pause state. Clips only added locally are kept.
+function fromServer(s) {
+  const c = s.clip || {};
+  return {
+    path: s.path, name: c.name || s.name, ok: true, codec: c.codec || "", width: c.width || 0, height: c.height || 0,
+    frames: c.frames || 0, fps: c.fps || 0, bytes: c.bytes || s.bytes, error: s.error,
+    id: s.id, state: s.state, fraction: s.fraction, rate: s.fps, target: null, force: s.force,
+    quality: s.quality, resolution: s.resolution, ran: { quality: s.quality, resolution: s.resolution },
+    output: s.output, result: s.result, onServer: true,
+  };
+}
+
+async function syncQueue(snap) {
+  if (!snap || !Array.isArray(snap.jobs)) return;
+  running = !!snap.running;
+  paused = !!snap.paused;
+  const ids = new Set(snap.jobs.map((s) => s.id));
+  dropJobs(jobs.filter((j) => j.onServer && !ids.has(j.id)));
+  const added = [];
+  for (const s of snap.jobs) {
+    let j = jobs.find((x) => x.id === s.id);
+    if (!j) {
+      j = fromServer(s);
+      jobs.push(j);
+      added.push(j);
+    } else {
+      Object.assign(j, {
+        state: s.state, fraction: s.fraction, rate: s.fps, error: s.error, onServer: true,
+        output: s.output || j.output, result: s.result || j.result,
+      });
+    }
+    // Finished clips of a restored run still count towards "n of m" in the footer.
+    const isNew = added.includes(j);
+    j.inRun = running && (s.state === "waiting" || s.state === "running" || (isNew ? true : !!j.inRun));
+    nextId = Math.max(nextId, s.id + 1);
+  }
+  for (const j of added) {
+    const t = await targetFor(j, j.resolution);
+    if (j.state === "done") j.resultTarget = t;
+    else j.target = t;
+  }
+  renderAll();
+  if (added.length) loadThumbs();
+}
+
+async function restoreQueue() {
+  if (!WEB) return;
+  try { await syncQueue(await api.invoke("get_queue")); } catch { /* older server */ }
+}
 
 function onEvents() {
   const find = (id) => jobs.find((j) => j.id === id);
@@ -538,9 +662,16 @@ function onEvents() {
   });
   api.listen("queue-finished", () => {
     running = false;
+    paused = false;
     for (const j of jobs) j.inRun = false;
     renderAll();
   });
+  api.listen("queue-paused", (p) => {
+    paused = !!(p && p.paused);
+    renderAll();
+  });
+  api.listen("queue-changed", (snap) => syncQueue(snap));
+  api.listen("events-reconnected", () => restoreQueue());
   api.listen("open-paths", (paths) => addPaths(paths));
   api.listen("quit-requested", () => $("quit-modal").classList.add("show"));
   api.listen("watch-status", (w) => renderWatch(w));
@@ -1151,8 +1282,8 @@ function bindViewer() {
 function onDragDrop(p) {
   const over = (p.type === "enter" || p.type === "over") && !viewer.open;
   const empty = jobs.length === 0;
-  $("drop-zone").classList.toggle("over", over && empty && !running);
-  $("drop-overlay").classList.toggle("show", over && !empty && !running);
+  $("drop-zone").classList.toggle("over", over && empty && canAdd());
+  $("drop-overlay").classList.toggle("show", over && !empty && canAdd());
   if (p.type === "drop" && !viewer.open) addPaths(p.paths);
 }
 
@@ -1164,9 +1295,9 @@ async function chooseOutput() {
   if (f) { settings.outputFolder = f; settings.dest = "custom"; }
   saveSettings(); renderSettings();
 }
-async function pickClips() { if (!running) addPaths(await api.invoke("pick_clips")); }
+async function pickClips() { if (canAdd()) addPaths(await api.invoke("pick_clips")); }
 async function pickFolder() {
-  if (running) return;
+  if (!canAdd()) return;
   const f = await api.invoke("pick_folder", { title: "Add Folder" });
   if (f) addPaths([f]);
 }
@@ -1229,7 +1360,8 @@ async function init() {
   $("btn-add-folder").addEventListener("click", pickFolder);
   $("empty-add").addEventListener("click", pickClips);
   $("empty-add-folder").addEventListener("click", pickFolder);
-  $("btn-clear").addEventListener("click", clearFinished);
+  $("btn-clear").addEventListener("click", clearList);
+  $("btn-pause").addEventListener("click", togglePause);
   $("btn-go").addEventListener("click", () => (running ? stop() : start()));
   $("quit-cancel").addEventListener("click", () => $("quit-modal").classList.remove("show"));
   $("beta-ok").addEventListener("click", () => {
@@ -1250,6 +1382,7 @@ async function init() {
   onEvents();
   api.onDragDrop(onDragDrop);
   running = await api.invoke("is_running");
+  await restoreQueue();
   renderAll();
   addPaths(await api.invoke("initial_paths"));
 }
@@ -1261,6 +1394,7 @@ function browserStandIn() {
   const handlers = {};
   const emit = (ev, p) => (handlers[ev] || []).forEach((f) => f(p));
   let cancel = false;
+  let paused = false;
   let last = "";
   const sample = [
     ["/Volumes/CARD/DCIM/CLIP_0001.NEV", "N-RAW", 8268, 4652, 360, 2.60e9],
@@ -1307,7 +1441,7 @@ function browserStandIn() {
     onDragDrop: () => {},
     invoke: async (cmd, a) => {
       switch (cmd) {
-        case "app_info": return { version: "0.1.3", gpu: "Metal: Apple GPU", cpu: "CPU (12 threads)", platform: "macos" };
+        case "app_info": return { version: "0.1.4", gpu: "Metal: Apple GPU", cpu: "CPU (12 threads)", platform: "macos" };
         case "is_running": return false;
         case "initial_paths": return location.hash === "#demo" ? ["demo"] : [];
         case "scan": return sample.map(([path, codec, width, height, frames, bytes]) => ({
@@ -1330,9 +1464,11 @@ function browserStandIn() {
         }
         case "pick_clips": return ["demo"];
         case "pick_folder": return "/Volumes/Archive/Compressed";
-        case "cancel": cancel = true; return;
+        case "cancel": cancel = true; paused = false; return;
+        case "set_paused": paused = !!a.paused; emit("queue-paused", { paused }); return { paused };
         case "start": {
           cancel = false;
+          paused = false;
           (async () => {
             for (const j of a.jobs) {
               if (cancel) break;
@@ -1341,10 +1477,11 @@ function browserStandIn() {
               let i = 0;
               for (; i <= total && !cancel; i++) {
                 await new Promise((r) => setTimeout(r, 40));
+                while (paused && !cancel) await new Promise((r) => setTimeout(r, 100));
                 emit("job-progress", { id: j.id, fraction: i / total, fps: 38 + Math.random() * 4 });
               }
               if (cancel) { emit("job-error", { id: j.id, error: "cancelled", cancelled: true }); break; }
-              emit("job-done", { id: j.id, output: j.path, inputBytes: 2.6e9, outputBytes: 2.12e9, frames: 360, seconds: 9.1, fps: 39.6, backend: "CPU" });
+              emit("job-done", { id: j.id, skipped: false, output: j.path, inputBytes: 2.6e9, outputBytes: 2.12e9, frames: 360, seconds: 9.1, fps: 39.6, backend: "CPU" });
             }
             emit("queue-finished", null);
           })();
@@ -1363,6 +1500,12 @@ function webApi() {
 
   const connectEvents = () => {
     const es = new EventSource("/api/events");
+    let opened = false;
+    // After a dropped connection (server restart, network), events were missed: resync.
+    es.onopen = () => {
+      if (opened) emit("events-reconnected", null);
+      opened = true;
+    };
     es.onmessage = (e) => {
       try {
         const msg = JSON.parse(e.data);

@@ -162,6 +162,56 @@ pub fn transcode(options: &Options, cancel: &AtomicBool, progress: &mut dyn FnMu
     transcode::transcode(options, cancel, progress)
 }
 
+/// Path of the staging file a queue writes a job to before renaming it to `target`:
+/// `<target>.bluecompress.tmp`. The core writer adds its own `.partial` suffix while writing.
+pub fn staging_path(target: &std::path::Path) -> PathBuf {
+    let mut s = target.as_os_str().to_owned();
+    s.push(".bluecompress.tmp");
+    PathBuf::from(s)
+}
+
+/// Removes leftovers of an interrupted run for `target` (for example after a crash or a
+/// container restart): `<target>.bluecompress.tmp`, its `.partial`, and `<target>.partial`.
+pub fn remove_stale_staging(target: &std::path::Path) {
+    let staging = staging_path(target);
+    let mut partial = staging.as_os_str().to_owned();
+    partial.push(".partial");
+    let mut direct = target.as_os_str().to_owned();
+    direct.push(".partial");
+    for p in [staging, PathBuf::from(partial), PathBuf::from(direct)] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// Transcodes like [`transcode`], but into [`staging_path`] of `options.output`, renaming it
+/// into place only when the whole clip succeeded. On error or cancel the staging file is
+/// removed, so an interrupted job never leaves a file under the final name.
+pub fn transcode_staged(options: &Options, cancel: &AtomicBool, progress: &mut dyn FnMut(f64, f64)) -> Result<Outcome> {
+    let target = options.output.clone();
+    remove_stale_staging(&target);
+    let staging = staging_path(&target);
+    let staged = Options { output: staging.clone(), ..options.clone() };
+    match transcode(&staged, cancel, progress) {
+        Ok(o) => match std::fs::rename(&staging, &target) {
+            Ok(()) => Ok(o),
+            Err(e) => {
+                let _ = std::fs::remove_file(&staging);
+                Err(Error(format!("cannot move output into place at {}: {e}", target.display())))
+            }
+        },
+        Err(e) => {
+            remove_stale_staging(&target);
+            Err(e)
+        }
+    }
+}
+
+/// An existing, non-empty compressed copy at `path`, if there is one. Queues use it to skip
+/// clips that an earlier, interrupted run already finished.
+pub fn existing_output(path: &std::path::Path) -> Option<u64> {
+    std::fs::metadata(path).ok().filter(|m| m.is_file() && m.len() > 0).map(|m| m.len())
+}
+
 /// Renders frame `frame` (clamped) of the clip before and after compression with the given
 /// quality and resolution, as a simple debayered preview `width` pixels wide. Both halves
 /// go through the same rendering, so differences come from compression alone.

@@ -43,6 +43,8 @@ struct ServerState {
     threads: usize,
     running: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    queue: Arc<Mutex<QueueState>>,
     worker: Mutex<Option<JoinHandle<()>>>,
     initial: Mutex<Vec<String>>,
     sse_clients: Arc<Mutex<Vec<TcpStream>>>,
@@ -86,7 +88,7 @@ struct SetWatchSettingsArgs {
     resolution: Option<String>,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Serialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 struct Settings {
     backend: String,
@@ -99,6 +101,65 @@ struct JobRequest {
     path: String,
     quality: u8,
     resolution: String,
+    /// Compress even when a compressed copy already exists ("Compress again").
+    #[serde(default)]
+    force: bool,
+    /// Clip details the UI shows on the card (name, codec, size, frames, fps), kept as is so
+    /// a reloaded page can rebuild its queue.
+    #[serde(default)]
+    clip: Option<serde_json::Value>,
+}
+
+/// One job of the server-side queue, as returned by `get_queue`.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct QueueJob {
+    id: u64,
+    path: String,
+    name: String,
+    bytes: u64,
+    quality: u8,
+    resolution: String,
+    force: bool,
+    clip: Option<serde_json::Value>,
+    /// waiting, running, done, failed or cancelled.
+    state: String,
+    fraction: f64,
+    fps: f64,
+    output: Option<String>,
+    result: Option<JobDone>,
+    error: Option<String>,
+}
+
+/// The queue the server is working through. It outlives the page that started it, so a
+/// reloaded or second browser tab can show the same cards, progress and pause state.
+#[derive(Default)]
+struct QueueState {
+    jobs: Vec<QueueJob>,
+    settings: Settings,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueSnapshot<'a> {
+    running: bool,
+    paused: bool,
+    jobs: &'a [QueueJob],
+}
+
+#[derive(Deserialize)]
+struct SetPausedArgs {
+    paused: bool,
+}
+
+#[derive(Deserialize)]
+struct RemoveJobsArgs {
+    /// Job ids to drop; without ids, every job that is not waiting or running.
+    #[serde(default)]
+    ids: Option<Vec<u64>>,
+    /// Also drop waiting jobs (only allowed while the queue is idle).
+    #[serde(default)]
+    all: bool,
 }
 
 #[derive(Deserialize)]
@@ -185,6 +246,8 @@ struct JobProgress {
 #[serde(rename_all = "camelCase")]
 struct JobDone {
     id: u64,
+    /// The output already existed, so the clip was not compressed again.
+    skipped: bool,
     output: String,
     input_bytes: u64,
     output_bytes: u64,
@@ -299,6 +362,22 @@ fn output_for(input: &Path, folder: Option<&str>, quality: u8, resolution: &str)
     let base = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let parent = dir.parent().unwrap_or(Path::new("."));
     (2..).map(|n| parent.join(format!("{base} ({n})")).join(name)).find(|p| free(p)).unwrap()
+}
+
+/// A finished compressed copy of `input` that an earlier run already wrote for this
+/// setting, if any: the places `output_for` would put it, in the same order.
+fn existing_for(input: &Path, folder: Option<&str>, quality: u8, resolution: &str) -> Option<(PathBuf, u64)> {
+    let tag = variant(quality, resolution);
+    let name = input.file_name()?;
+    let candidates: Vec<PathBuf> = match folder {
+        Some(f) if !f.is_empty() => vec![Path::new(f).join(name), Path::new(f).join(&tag).join(name)],
+        _ => vec![input.parent().unwrap_or(Path::new(".")).join(format!("Compressed {tag}")).join(name)],
+    };
+    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    };
+    candidates.into_iter().filter(|p| !same(p, input)).find_map(|p| bluecompress::existing_output(&p).map(|n| (p, n)))
 }
 
 fn broadcast_event<T: Serialize>(clients: &Mutex<Vec<TcpStream>>, event: &str, payload: T) {
@@ -435,97 +514,249 @@ fn handle_fs_mkdir(state: &ServerState, args: FsMkdirArgs) -> Result<serde_json:
     Ok(serde_json::json!({ "path": ps(&canon) }))
 }
 
+fn queue_snapshot(state: &ServerState) -> serde_json::Value {
+    let q = state.queue.lock().unwrap();
+    serde_json::to_value(QueueSnapshot {
+        running: state.running.load(Ordering::SeqCst),
+        paused: state.paused.load(Ordering::SeqCst),
+        jobs: &q.jobs,
+    })
+    .unwrap_or(serde_json::Value::Null)
+}
+
+fn broadcast_paused(state: &ServerState) {
+    broadcast_event(
+        &state.sse_clients,
+        "queue-paused",
+        serde_json::json!({ "paused": state.paused.load(Ordering::SeqCst) }),
+    );
+}
+
+fn update_job(state: &ServerState, id: u64, f: impl FnOnce(&mut QueueJob)) {
+    if let Some(j) = state.queue.lock().unwrap().jobs.iter_mut().find(|j| j.id == id) {
+        f(j);
+    }
+}
+
+fn job_error(state: &ServerState, id: u64, error: String, cancelled: bool) {
+    update_job(state, id, |j| {
+        j.state = if cancelled { "cancelled".into() } else { "failed".into() };
+        j.error = if cancelled { None } else { Some(error.clone()) };
+    });
+    broadcast_event(&state.sse_clients, "job-error", JobError { id, error, cancelled });
+}
+
+/// Seconds a finished clip actually spent compressing, without the time it was paused.
+fn active_seconds(seconds: f64, paused_for: std::time::Duration) -> f64 {
+    (seconds - paused_for.as_secs_f64()).max(0.0)
+}
+
+/// Frames per second of a finished clip, without the time it was paused.
+fn active_fps(frames: u32, seconds: f64, fps: f64, paused_for: std::time::Duration) -> f64 {
+    let s = active_seconds(seconds, paused_for);
+    if paused_for.is_zero() || s <= 0.0 {
+        fps
+    } else {
+        f64::from(frames) / s
+    }
+}
+
+/// Blocks while the queue is paused. Returns false when it was cancelled meanwhile.
+fn wait_while_paused(state: &ServerState) -> bool {
+    while state.paused.load(Ordering::SeqCst) && !state.cancel.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    !state.cancel.load(Ordering::SeqCst)
+}
+
+/// Adds jobs to the server queue and starts the worker when it is idle. While a queue is
+/// running the new jobs are appended and picked up in turn with the run's settings.
 fn start_queue(state: &Arc<ServerState>, args: StartArgs) -> Result<(), String> {
-    if state.running.swap(true, Ordering::SeqCst) {
-        return Err("already running".into());
+    {
+        let mut q = state.queue.lock().unwrap();
+        let running = state.running.load(Ordering::SeqCst);
+        if !running {
+            q.settings = args.settings.clone();
+        }
+        for job in args.jobs {
+            let name = Path::new(&job.path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let bytes = std::fs::metadata(&job.path).map(|m| m.len()).unwrap_or(0);
+            let entry = QueueJob {
+                id: job.id,
+                path: job.path,
+                name,
+                bytes,
+                quality: job.quality.clamp(1, 4),
+                resolution: job.resolution,
+                force: job.force,
+                clip: job.clip,
+                state: "waiting".into(),
+                fraction: 0.0,
+                fps: 0.0,
+                output: None,
+                result: None,
+                error: None,
+            };
+            match q.jobs.iter_mut().find(|j| j.id == entry.id) {
+                Some(existing) if existing.state != "running" => *existing = entry,
+                Some(_) => {}
+                None => q.jobs.push(entry),
+            }
+        }
+    }
+    let already_running = state.running.swap(true, Ordering::SeqCst);
+    broadcast_event(&state.sse_clients, "queue-changed", queue_snapshot(state));
+    if already_running {
+        return Ok(());
     }
     if let Some(h) = state.worker.lock().unwrap().take() {
         let _ = h.join();
     }
     state.cancel.store(false, Ordering::SeqCst);
+    state.paused.store(false, Ordering::SeqCst);
     let st = state.clone();
     let handle = std::thread::spawn(move || {
-        let backend = backend_of(&args.settings.backend, st.default_backend);
-        for job in args.jobs {
-            if st.cancel.load(Ordering::SeqCst) {
+        loop {
+            if !wait_while_paused(&st) {
                 break;
             }
-            let input = PathBuf::from(&job.path);
-            let resized = bluecompress::probe(&input)
-                .map(|i| {
-                    bluecompress::output_size(i.width, i.height, resolution_of(&job.resolution)) != (i.width, i.height)
-                })
-                .unwrap_or(false);
-            let res_name = if resized { job.resolution.as_str() } else { "original" };
-            let output = output_for(&input, args.settings.output_folder.as_deref(), job.quality.clamp(1, 4), res_name);
-            if let Some(dir) = output.parent() {
-                if let Err(e) = std::fs::create_dir_all(dir) {
-                    broadcast_event(
-                        &st.sse_clients,
-                        "job-error",
-                        JobError {
-                            id: job.id,
-                            error: format!("cannot create {}: {e}", dir.display()),
-                            cancelled: false,
-                        },
-                    );
-                    continue;
-                }
-            }
-            let _guard = st.transcode_lock.lock().unwrap();
-            if st.cancel.load(Ordering::SeqCst) {
-                break;
-            }
-            let out_s = ps(&output);
-            broadcast_event(&st.sse_clients, "job-start", JobStart { id: job.id, output: out_s.clone() });
-            let options = Options {
-                input,
-                output,
-                quality: job.quality.clamp(1, 4),
-                resolution: resolution_of(&job.resolution),
-                backend,
-                threads: st.threads,
-            };
-            let mut last = Instant::now() - Duration::from_secs(1);
-            let clients = st.sse_clients.clone();
-            let mut on_progress = |fraction: f64, fps: f64| {
-                if fraction >= 1.0 || last.elapsed().as_millis() >= 100 {
-                    last = Instant::now();
-                    broadcast_event(&clients, "job-progress", JobProgress { id: job.id, fraction, fps });
+            // Next waiting job, in queue order (jobs added during the run included).
+            let (job, settings) = {
+                let q = st.queue.lock().unwrap();
+                match q.jobs.iter().find(|j| j.state == "waiting") {
+                    Some(j) => (j.clone(), q.settings.clone()),
+                    None => break,
                 }
             };
-            match bluecompress::transcode(&options, &st.cancel, &mut on_progress) {
-                Ok(o) => {
-                    broadcast_event(
-                        &st.sse_clients,
-                        "job-done",
-                        JobDone {
-                            id: job.id,
-                            output: out_s,
-                            input_bytes: o.input_bytes,
-                            output_bytes: o.output_bytes,
-                            frames: o.frames,
-                            seconds: o.seconds,
-                            fps: o.fps,
-                            backend: o.backend,
-                        },
-                    );
-                }
-                Err(e) => {
-                    let cancelled = st.cancel.load(Ordering::SeqCst);
-                    broadcast_event(
-                        &st.sse_clients,
-                        "job-error",
-                        JobError { id: job.id, error: e.to_string(), cancelled },
-                    );
-                }
-            }
+            run_job(&st, &job, &settings);
         }
         st.running.store(false, Ordering::SeqCst);
+        if st.paused.swap(false, Ordering::SeqCst) {
+            broadcast_paused(&st);
+        }
         broadcast_event(&st.sse_clients, "queue-finished", serde_json::Value::Null);
     });
     *state.worker.lock().unwrap() = Some(handle);
     Ok(())
+}
+
+fn run_job(st: &Arc<ServerState>, job: &QueueJob, settings: &Settings) {
+    let backend = backend_of(&settings.backend, st.default_backend);
+    let folder = settings.output_folder.as_deref();
+    let quality = job.quality.clamp(1, 4);
+    let input = PathBuf::from(&job.path);
+    let info = bluecompress::probe(&input).ok();
+    let resized = info
+        .as_ref()
+        .map(|i| bluecompress::output_size(i.width, i.height, resolution_of(&job.resolution)) != (i.width, i.height))
+        .unwrap_or(false);
+    let res_name = if resized { job.resolution.as_str() } else { "original" };
+
+    // Already compressed by an earlier (for example interrupted) run: keep it.
+    if !job.force {
+        if let Some((out, out_bytes)) = existing_for(&input, folder, quality, res_name) {
+            let done = JobDone {
+                id: job.id,
+                skipped: true,
+                output: ps(&out),
+                input_bytes: job.bytes,
+                output_bytes: out_bytes,
+                frames: info.as_ref().map(|i| i.frames).unwrap_or(0),
+                seconds: 0.0,
+                fps: 0.0,
+                backend: String::new(),
+            };
+            update_job(st, job.id, |j| {
+                j.state = "done".into();
+                j.fraction = 1.0;
+                j.output = Some(done.output.clone());
+                j.result = Some(done.clone());
+            });
+            broadcast_event(&st.sse_clients, "job-done", done);
+            return;
+        }
+    }
+
+    let output = output_for(&input, folder, quality, res_name);
+    if let Some(dir) = output.parent() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            job_error(st, job.id, format!("cannot create {}: {e}", dir.display()), false);
+            return;
+        }
+    }
+    let lock = st.transcode_lock.clone();
+    let mut guard = Some(lock.lock().unwrap());
+    if st.cancel.load(Ordering::SeqCst) {
+        return;
+    }
+    let out_s = ps(&output);
+    update_job(st, job.id, |j| {
+        j.state = "running".into();
+        j.output = Some(out_s.clone());
+        j.fraction = 0.0;
+        j.fps = 0.0;
+    });
+    broadcast_event(&st.sse_clients, "job-start", JobStart { id: job.id, output: out_s.clone() });
+    let options =
+        Options { input, output, quality, resolution: resolution_of(&job.resolution), backend, threads: st.threads };
+    let mut last = Instant::now() - Duration::from_secs(1);
+    let clients = st.sse_clients.clone();
+    // The core reports frames per second since the clip started; take paused time out.
+    let started = Instant::now();
+    let mut paused_for = Duration::ZERO;
+    let mut on_progress = |fraction: f64, fps: f64| {
+        let total = started.elapsed().as_secs_f64();
+        let active = total - paused_for.as_secs_f64();
+        let fps = if active > 0.0 { fps * total / active } else { fps };
+        if fraction >= 1.0 || last.elapsed().as_millis() >= 100 {
+            last = Instant::now();
+            update_job(st, job.id, |j| {
+                j.fraction = fraction;
+                j.fps = fps;
+            });
+            broadcast_event(&clients, "job-progress", JobProgress { id: job.id, fraction, fps });
+        }
+        // Pause mid-clip: hold the writer here, which stalls the frame workers once their
+        // small read-ahead is full. The shared transcode lock is released while paused so
+        // the watch folder keeps working, and taken back before the clip continues.
+        if st.paused.load(Ordering::SeqCst) {
+            let since = Instant::now();
+            guard = None;
+            wait_while_paused(st);
+            if !st.cancel.load(Ordering::SeqCst) {
+                guard = Some(lock.lock().unwrap());
+            }
+            paused_for += since.elapsed();
+            last = Instant::now() - Duration::from_secs(1);
+        }
+    };
+    let result = bluecompress::transcode_staged(&options, &st.cancel, &mut on_progress);
+    drop(guard);
+    match result {
+        Ok(o) => {
+            let done = JobDone {
+                id: job.id,
+                skipped: false,
+                output: out_s,
+                input_bytes: o.input_bytes,
+                output_bytes: o.output_bytes,
+                frames: o.frames,
+                seconds: active_seconds(o.seconds, paused_for),
+                fps: active_fps(o.frames, o.seconds, o.fps, paused_for),
+                backend: o.backend,
+            };
+            update_job(st, job.id, |j| {
+                j.state = "done".into();
+                j.fraction = 1.0;
+                j.result = Some(done.clone());
+            });
+            broadcast_event(&st.sse_clients, "job-done", done);
+        }
+        Err(e) => {
+            let cancelled = st.cancel.load(Ordering::SeqCst);
+            job_error(st, job.id, e.to_string(), cancelled);
+        }
+    }
 }
 
 fn invoke_command(state: &Arc<ServerState>, cmd: &str, body: &[u8]) -> HttpResponse {
@@ -587,6 +818,40 @@ fn invoke_command(state: &Arc<ServerState>, cmd: &str, body: &[u8]) -> HttpRespo
             HttpResponse::json(200, &snap)
         }
         "is_running" => HttpResponse::json(200, &state.running.load(Ordering::SeqCst)),
+        "get_queue" => HttpResponse::json(200, &queue_snapshot(state)),
+        "set_paused" => {
+            let args: SetPausedArgs = match serde_json::from_slice(body) {
+                Ok(a) => a,
+                Err(e) => return HttpResponse::text(400, &format!("invalid set_paused args: {e}")),
+            };
+            state.paused.store(args.paused && state.running.load(Ordering::SeqCst), Ordering::SeqCst);
+            broadcast_paused(state);
+            HttpResponse::json(200, &serde_json::json!({ "paused": state.paused.load(Ordering::SeqCst) }))
+        }
+        "remove_jobs" => {
+            let args: RemoveJobsArgs = match serde_json::from_slice(body) {
+                Ok(a) => a,
+                Err(e) => return HttpResponse::text(400, &format!("invalid remove_jobs args: {e}")),
+            };
+            let running = state.running.load(Ordering::SeqCst);
+            {
+                let mut q = state.queue.lock().unwrap();
+                q.jobs.retain(|j| {
+                    // The clip being compressed always stays; waiting clips only go when
+                    // asked by id or, with `all`, while nothing runs.
+                    if j.state == "running" {
+                        return true;
+                    }
+                    match &args.ids {
+                        Some(ids) => !ids.contains(&j.id),
+                        None => j.state == "waiting" && (running || !args.all),
+                    }
+                });
+            }
+            let snap = queue_snapshot(state);
+            broadcast_event(&state.sse_clients, "queue-changed", &snap);
+            HttpResponse::json(200, &snap)
+        }
         "initial_paths" => {
             let paths: Vec<String> = std::mem::take(&mut *state.initial.lock().unwrap());
             HttpResponse::json(200, &paths)
@@ -671,6 +936,9 @@ fn invoke_command(state: &Arc<ServerState>, cmd: &str, body: &[u8]) -> HttpRespo
         }
         "cancel" | "confirm_quit" => {
             state.cancel.store(true, Ordering::SeqCst);
+            if state.paused.swap(false, Ordering::SeqCst) {
+                broadcast_paused(state);
+            }
             HttpResponse::json(200, &serde_json::Value::Null)
         }
         "reveal" => HttpResponse::json(200, &serde_json::Value::Null),
@@ -906,6 +1174,8 @@ pub fn run_serve(cfg: ServeConfig, cancel: &'static AtomicBool) -> u8 {
         threads: cfg.threads,
         running: Arc::new(AtomicBool::new(false)),
         cancel: Arc::new(AtomicBool::new(false)),
+        paused: Arc::new(AtomicBool::new(false)),
+        queue: Arc::new(Mutex::new(QueueState::default())),
         worker: Mutex::new(None),
         initial: Mutex::new(cfg.initial_paths),
         sse_clients: Arc::new(Mutex::new(Vec::new())),

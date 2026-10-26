@@ -2,11 +2,11 @@
 //! scans and probes clips, runs jobs one after another on a worker thread, and reports
 //! progress with events.
 //!
-//! Commands: app_info, scan, plan_output, preview, thumbnail, start, cancel, is_running,
-//! pick_clips, pick_folder, reveal, initial_paths, confirm_quit.
+//! Commands: app_info, scan, plan_output, preview, thumbnail, start, cancel, set_paused,
+//! is_running, pick_clips, pick_folder, reveal, initial_paths, confirm_quit.
 //! Events: job-start {id, output}, job-progress {id, fraction, fps},
-//! job-done {id, ...outcome}, job-error {id, error, cancelled}, queue-finished {},
-//! open-paths [paths], quit-requested {}.
+//! job-done {id, skipped, ...outcome}, job-error {id, error, cancelled}, queue-finished {},
+//! queue-paused {paused}, open-paths [paths], quit-requested {}.
 
 mod engine;
 
@@ -25,6 +25,7 @@ use engine::{Backend, Codec, Options, Resolution};
 struct Runner {
     running: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     worker: Mutex<Option<JoinHandle<()>>>,
     initial: Mutex<Vec<String>>,
     quitting: AtomicBool,
@@ -66,6 +67,14 @@ struct JobRequest {
     path: String,
     quality: u8,
     resolution: String,
+    /// Compress even when a compressed copy already exists ("Compress again").
+    #[serde(default)]
+    force: bool,
+}
+
+#[derive(Serialize, Clone)]
+struct Paused {
+    paused: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -85,6 +94,8 @@ struct JobProgress {
 #[serde(rename_all = "camelCase")]
 struct JobDone {
     id: u64,
+    /// The output already existed, so the clip was not compressed again.
+    skipped: bool,
     output: String,
     input_bytes: u64,
     output_bytes: u64,
@@ -288,6 +299,45 @@ async fn thumbnail(path: String, width: u32) -> Result<tauri::ipc::Response, Str
     Ok(tauri::ipc::Response::new(out))
 }
 
+/// A compressed copy of `input` for this setting that an earlier run already finished, if
+/// any: the places `output_for` would put it, in the same order.
+fn existing_for(input: &Path, folder: Option<&str>, quality: u8, resolution: &str) -> Option<(PathBuf, u64)> {
+    let tag = variant(quality, resolution);
+    let name = input.file_name()?;
+    let candidates: Vec<PathBuf> = match folder {
+        Some(f) if !f.is_empty() => vec![Path::new(f).join(name), Path::new(f).join(&tag).join(name)],
+        _ => vec![input.parent().unwrap_or(Path::new(".")).join(format!("Compressed {tag}")).join(name)],
+    };
+    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    };
+    candidates.into_iter().filter(|p| !same(p, input)).find_map(|p| engine::existing_output(&p).map(|n| (p, n)))
+}
+
+/// Seconds a finished clip actually spent compressing, without the time it was paused.
+fn active_seconds(seconds: f64, paused_for: std::time::Duration) -> f64 {
+    (seconds - paused_for.as_secs_f64()).max(0.0)
+}
+
+/// Frames per second of a finished clip, without the time it was paused.
+fn active_fps(frames: u32, seconds: f64, fps: f64, paused_for: std::time::Duration) -> f64 {
+    let s = active_seconds(seconds, paused_for);
+    if paused_for.is_zero() || s <= 0.0 {
+        fps
+    } else {
+        f64::from(frames) / s
+    }
+}
+
+/// Blocks while the queue is paused. Returns false when it was cancelled meanwhile.
+fn wait_while_paused(paused: &AtomicBool, cancel: &AtomicBool) -> bool {
+    while paused.load(Ordering::SeqCst) && !cancel.load(Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    !cancel.load(Ordering::SeqCst)
+}
+
 #[tauri::command]
 fn is_running(state: State<'_, Runner>) -> bool {
     state.running.load(Ordering::SeqCst)
@@ -302,12 +352,14 @@ fn start(app: AppHandle, state: State<'_, Runner>, jobs: Vec<JobRequest>, settin
         let _ = h.join();
     }
     state.cancel.store(false, Ordering::SeqCst);
+    state.paused.store(false, Ordering::SeqCst);
     let running = state.running.clone();
     let cancel = state.cancel.clone();
+    let paused = state.paused.clone();
     let handle = std::thread::spawn(move || {
         let backend = backend_of(&settings.backend);
         for job in jobs {
-            if cancel.load(Ordering::SeqCst) {
+            if !wait_while_paused(&paused, &cancel) {
                 break;
             }
             let input = PathBuf::from(&job.path);
@@ -316,6 +368,28 @@ fn start(app: AppHandle, state: State<'_, Runner>, jobs: Vec<JobRequest>, settin
                 .map(|i| engine::output_size(i.width, i.height, resolution(&job.resolution)) != (i.width, i.height))
                 .unwrap_or(false);
             let res_name = if resized { job.resolution.as_str() } else { "original" };
+            // Already compressed by an earlier, interrupted run: keep it.
+            if !job.force {
+                if let Some((out, out_bytes)) =
+                    existing_for(&input, settings.output_folder.as_deref(), job.quality.clamp(1, 4), res_name)
+                {
+                    let _ = app.emit(
+                        "job-done",
+                        JobDone {
+                            id: job.id,
+                            skipped: true,
+                            output: out.to_string_lossy().into_owned(),
+                            input_bytes: std::fs::metadata(&input).map(|m| m.len()).unwrap_or(0),
+                            output_bytes: out_bytes,
+                            frames: 0,
+                            seconds: 0.0,
+                            fps: 0.0,
+                            backend: String::new(),
+                        },
+                    );
+                    continue;
+                }
+            }
             let output = output_for(&input, settings.output_folder.as_deref(), job.quality.clamp(1, 4), res_name);
             if let Some(dir) = output.parent() {
                 if let Err(e) = std::fs::create_dir_all(dir) {
@@ -342,24 +416,39 @@ fn start(app: AppHandle, state: State<'_, Runner>, jobs: Vec<JobRequest>, settin
             };
             let mut last = Instant::now() - std::time::Duration::from_secs(1);
             let app2 = app.clone();
+            // The core reports frames per second since the clip started; take paused time out.
+            let started = Instant::now();
+            let mut paused_for = std::time::Duration::ZERO;
             let mut on_progress = |fraction: f64, fps: f64| {
+                let total = started.elapsed().as_secs_f64();
+                let active = total - paused_for.as_secs_f64();
+                let fps = if active > 0.0 { fps * total / active } else { fps };
                 if fraction >= 1.0 || last.elapsed().as_millis() >= 100 {
                     last = Instant::now();
                     let _ = app2.emit("job-progress", JobProgress { id: job.id, fraction, fps });
                 }
+                // Pause mid-clip: hold the writer here; the frame workers stop once their
+                // small read-ahead is full.
+                if paused.load(Ordering::SeqCst) {
+                    let since = Instant::now();
+                    wait_while_paused(&paused, &cancel);
+                    paused_for += since.elapsed();
+                    last = Instant::now() - std::time::Duration::from_secs(1);
+                }
             };
-            match engine::transcode(&options, &cancel, &mut on_progress) {
+            match engine::transcode_staged(&options, &cancel, &mut on_progress) {
                 Ok(o) => {
                     let _ = app.emit(
                         "job-done",
                         JobDone {
                             id: job.id,
+                            skipped: false,
                             output: out_s,
                             input_bytes: o.input_bytes,
                             output_bytes: o.output_bytes,
                             frames: o.frames,
-                            seconds: o.seconds,
-                            fps: o.fps,
+                            seconds: active_seconds(o.seconds, paused_for),
+                            fps: active_fps(o.frames, o.seconds, o.fps, paused_for),
                             backend: o.backend,
                         },
                     );
@@ -371,6 +460,9 @@ fn start(app: AppHandle, state: State<'_, Runner>, jobs: Vec<JobRequest>, settin
             }
         }
         running.store(false, Ordering::SeqCst);
+        if paused.swap(false, Ordering::SeqCst) {
+            let _ = app.emit("queue-paused", Paused { paused: false });
+        }
         let _ = app.emit("queue-finished", ());
         if app.state::<Runner>().quitting.load(Ordering::SeqCst) {
             app.exit(0);
@@ -381,8 +473,20 @@ fn start(app: AppHandle, state: State<'_, Runner>, jobs: Vec<JobRequest>, settin
 }
 
 #[tauri::command]
-fn cancel(state: State<'_, Runner>) {
+fn cancel(app: AppHandle, state: State<'_, Runner>) {
     state.cancel.store(true, Ordering::SeqCst);
+    if state.paused.swap(false, Ordering::SeqCst) {
+        let _ = app.emit("queue-paused", Paused { paused: false });
+    }
+}
+
+/// Pauses (mid-clip) or resumes the running queue.
+#[tauri::command]
+fn set_paused(app: AppHandle, state: State<'_, Runner>, paused: bool) -> Paused {
+    let p = paused && state.running.load(Ordering::SeqCst);
+    state.paused.store(p, Ordering::SeqCst);
+    let _ = app.emit("queue-paused", Paused { paused: p });
+    Paused { paused: p }
 }
 
 /// Quit after the running job has been cancelled and cleaned up.
@@ -445,6 +549,7 @@ pub fn run() {
             thumbnail,
             start,
             cancel,
+            set_paused,
             is_running,
             pick_clips,
             pick_folder,

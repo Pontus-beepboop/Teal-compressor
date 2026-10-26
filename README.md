@@ -2,19 +2,19 @@
 
 ## Download
 
-**[Latest release (v0.1.3 beta)](https://github.com/redn3/blue-compressor/releases/tag/v0.1.3)**. Pick the file for your computer:
+**[Latest release (v0.1.4 beta)](https://github.com/redn3/blue-compressor/releases/tag/v0.1.4)**. Pick the file for your computer:
 
 | Your computer | Download |
 | --- | --- |
-| Mac with Apple silicon (M1, M2, M3, M4, M5) | [Blue-Compressor_0.1.3_macOS_arm64.dmg](https://github.com/redn3/blue-compressor/releases/download/v0.1.3/Blue-Compressor_0.1.3_macOS_arm64.dmg) |
-| Mac with Intel processor | [Blue-Compressor_0.1.3_macOS_x64.dmg](https://github.com/redn3/blue-compressor/releases/download/v0.1.3/Blue-Compressor_0.1.3_macOS_x64.dmg) |
-| Windows 10 or 11 | [Blue-Compressor_0.1.3_Windows_x64-setup.exe](https://github.com/redn3/blue-compressor/releases/download/v0.1.3/Blue-Compressor_0.1.3_Windows_x64-setup.exe) |
-| Linux (any distribution) | [Blue-Compressor_0.1.3_Linux_x64.AppImage](https://github.com/redn3/blue-compressor/releases/download/v0.1.3/Blue-Compressor_0.1.3_Linux_x64.AppImage) |
+| Mac with Apple silicon (M1, M2, M3, M4, M5) | [Blue-Compressor_0.1.4_macOS_arm64.dmg](https://github.com/redn3/blue-compressor/releases/download/v0.1.4/Blue-Compressor_0.1.4_macOS_arm64.dmg) |
+| Mac with Intel processor | [Blue-Compressor_0.1.4_macOS_x64.dmg](https://github.com/redn3/blue-compressor/releases/download/v0.1.4/Blue-Compressor_0.1.4_macOS_x64.dmg) |
+| Windows 10 or 11 | [Blue-Compressor_0.1.4_Windows_x64-setup.exe](https://github.com/redn3/blue-compressor/releases/download/v0.1.4/Blue-Compressor_0.1.4_Windows_x64-setup.exe) |
+| Linux (any distribution) | [Blue-Compressor_0.1.4_Linux_x64.AppImage](https://github.com/redn3/blue-compressor/releases/download/v0.1.4/Blue-Compressor_0.1.4_Linux_x64.AppImage) |
 | Docker / Synology NAS (`amd64` and `arm64`) | `docker pull ghcr.io/redn3/blue-compressor:latest` ([setup guide](#docker-and-synology-nas)) |
 
 Not sure which Mac you have? Open the Apple menu and choose About This Mac. If it says "Chip", get Apple silicon; if it says "Processor" with Intel, get Intel.
 
-Other formats (Windows `.msi`, Linux `.deb` and `.rpm`) and the command line tool are on the [release page](https://github.com/redn3/blue-compressor/releases/tag/v0.1.3).
+Other formats (Windows `.msi`, Linux `.deb` and `.rpm`) and the command line tool are on the [release page](https://github.com/redn3/blue-compressor/releases/tag/v0.1.4).
 
 Blue Compressor makes Nikon **N-RAW** (`.NEV`, e.g. Z8, Z9, Z6III) and **R3D NE**
 (`.R3D`, e.g. Nikon ZR) clips smaller. It re-encodes the TICO RAW (JPEG XS) data inside
@@ -25,6 +25,15 @@ meant to open in the same software as the camera originals.
 There is a desktop app (macOS, Windows, Linux) with drag and drop and a before/after
 quality previewer. There is also a headless command line tool and a C API for scripts
 and build servers.
+
+In the queue (desktop app and Web UI), **Pause** holds the running clip where it is and
+**Resume** continues it; **Stop** still cancels, also while paused. **Clear List** empties
+the list when nothing is running; while compressing it removes only the finished clips.
+Each clip is written to a temporary file and renamed when it is complete, so an interrupted
+run (a crash, or a NAS or container restart) never leaves a broken clip under the final
+name. A clip whose compressed copy for the same setting already exists is skipped and shown
+as **Already done**, so adding the same folder again after an interruption only compresses
+the clips that are left. Use **Compress again** on a finished clip to force a new version.
 
 ![Blue Compressor desktop app](docs/screenshot.png)
 
@@ -159,7 +168,7 @@ Options: `-q 1..4`, `-r original|6k|4k`, `-b auto|cpu|metal|cuda|opencl`, `-j th
 
 The official multi-arch image (`ghcr.io/redn3/blue-compressor:latest`, built for both `linux/amd64` and `linux/arm64`) packs three modes into one container:
 
-1. **Web UI on port `9847`**: the full Blue Compressor interface in your browser, with a server-side folder browser for NAS shares, live queue progress, and the before/after quality previewer.
+1. **Web UI on port `9847`**: the full Blue Compressor interface in your browser, with a server-side folder browser for NAS shares, live queue progress, and the before/after quality previewer. The queue runs on the server: reloading or closing the page does not stop it, and the page restores the clips, progress and pause state when you open it again. You can add more clips while it runs.
 2. **Watch-folder daemon**: watches `/watch/in` recursively for `.NEV` and `.R3D` clips, waits for incoming SMB/AFP network copies to finish (size and modification time stable across polls), and writes compressed copies to `/watch/out` atomically while preserving subfolder structure.
 3. **Command line (`bluecompress`)**: pass any subcommand (`compress`, `probe`, `watch`, `backends`) to run it directly.
 

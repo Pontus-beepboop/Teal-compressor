@@ -1,13 +1,13 @@
 //! The engine the app drives: the real core, or (feature `mock`) a stand-in with realistic
 //! numbers for working on the interface without decoding anything.
 
-pub use bluecompress::{Backend, Codec, Options, Resolution};
+pub use bluecompress::{existing_output, Backend, Codec, Options, Resolution};
 
 #[cfg(not(feature = "mock"))]
-pub use bluecompress::{backend_description, output_size, preview_region, probe, thumbnail, transcode};
+pub use bluecompress::{backend_description, output_size, preview_region, probe, thumbnail, transcode_staged};
 
 #[cfg(feature = "mock")]
-pub use mock::{backend_description, output_size, preview_region, probe, thumbnail, transcode};
+pub use mock::{backend_description, output_size, preview_region, probe, thumbnail, transcode_staged};
 
 #[cfg(feature = "mock")]
 mod mock {
@@ -189,6 +189,15 @@ mod mock {
     pub fn thumbnail(path: &Path, frame: u32, width: u32) -> bluecompress::Result<Thumbnail> {
         let p = preview_region(path, frame, 1, Resolution::Original, Backend::Cpu, [0.0, 0.0, 1.0, 1.0], width)?;
         Ok(Thumbnail { width: p.width, height: p.height, rgba: p.before_rgba })
+    }
+
+    /// The mock writes no files, so staging is the same as a plain run.
+    pub fn transcode_staged(
+        o: &Options,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(f64, f64),
+    ) -> bluecompress::Result<Outcome> {
+        transcode(o, cancel, progress)
     }
 
     pub fn transcode(

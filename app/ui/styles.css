@@ -431,6 +431,7 @@ svg .fill { fill: currentColor; stroke: none; }
 .job-pill.running { background: var(--accent-soft); color: var(--accent-2); }
 .job-pill.done { background: var(--ok-soft); color: var(--ok); }
 .job-pill.failed { background: var(--err-soft); color: var(--err); }
+.job-pill.paused { background: var(--seg-bg); color: var(--text-2); }
 .job-meta {
   margin-top: 3px;
   color: var(--text-3);
@@ -477,6 +478,8 @@ svg .fill { fill: currentColor; stroke: none; }
   overflow: hidden;
 }
 .job.done .job-progress-fill { background: var(--ok); opacity: 0.7; }
+.job.running.paused .job-progress-fill { opacity: 0.5; }
+.job.running.paused .job-progress-fill::after { display: none; }
 
 /* Footer ------------------------------------------------------------------- */
 
@@ -493,6 +496,7 @@ svg .fill { fill: currentColor; stroke: none; }
 .bar-progress { position: absolute; top: -1px; left: 0; right: 0; height: 2px; }
 .bar-progress-fill { height: 100%; width: 0; background: var(--accent); transition: width 0.3s linear; }
 .bar-left { min-width: 0; }
+.bar-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .bar-main { font-weight: 600; font-size: 13.5px; font-variant-numeric: tabular-nums; letter-spacing: -0.005em; }
 .bar-main .good { color: var(--ok); }
 .bar-sub { color: var(--text-3); font-size: 12px; font-variant-numeric: tabular-nums; margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
