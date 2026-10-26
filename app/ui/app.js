@@ -46,6 +46,10 @@ let jobs = [];
 let nextId = 1;
 let running = false;
 let paused = false;
+// Totals of the current batch for the "saved so far" counter. Clips skipped at run time
+// because their output already existed count as done, not towards the bytes.
+const emptyBatch = () => ({ total: 0, done: 0, skipped: 0, failed: 0, inputBytes: 0, outputBytes: 0 });
+let batch = emptyBatch();
 let info = { gpu: "", cpu: "", platform: "" };
 const els = new Map(); // job id -> card element
 
@@ -59,6 +63,56 @@ function saveSettings() {
 // Effective settings of a job: its own when settings are per clip, else the global ones.
 const qualityOf = (j) => (settings.sameForAll ? settings.quality : j.quality);
 const resolutionOf = (j) => (settings.sameForAll ? settings.resolution : j.resolution);
+
+// Clips whose compressed copy for their current setting already exists are "already done":
+// found when they are added and whenever a setting or the output folder changes, and left
+// out of the run. "Compress again" (force) makes a new version anyway.
+const outFolder = () => (settings.dest === "custom" ? settings.outputFolder : null);
+const existKey = (j) => `${qualityOf(j)}|${resolutionOf(j)}|${outFolder() || ""}`;
+const isAlready = (j) => j.ok && j.state === "waiting" && !j.force && !!j.existing;
+// Already done in any form: found up front, or skipped by a run (kept as done).
+const alreadyDone = (j) => isAlready(j) || (j.state === "done" && !!j.result && !!j.result.skipped);
+const alreadyIn = (j) => j.bytes;
+const alreadyOut = (j) => (j.existing && j.state === "waiting" ? j.existing.bytes : j.result.outputBytes);
+const toCompress = (j) => j.ok && j.state === "waiting" && !isAlready(j);
+const needsCheck = (j) => j.ok && j.state === "waiting" && !j.force && j.existKey !== existKey(j);
+
+let existTimer = 0;
+let existRun = null;
+function scheduleExistingCheck() {
+  if (!jobs.some(needsCheck)) return;
+  clearTimeout(existTimer);
+  existTimer = setTimeout(checkExisting, 120);
+}
+async function checkExisting() {
+  while (existRun) await existRun;
+  const stale = jobs.filter(needsCheck);
+  if (!stale.length) return;
+  existRun = (async () => {
+    const folder = outFolder();
+    const keys = new Map(stale.map((j) => [j.id, existKey(j)]));
+    let found = [];
+    try {
+      for (let i = 0; i < stale.length; i += 500) {
+        const items = stale.slice(i, i + 500).map((j) => ({
+          id: j.id, path: j.path, quality: qualityOf(j), resolution: resolutionOf(j), width: j.width, height: j.height,
+        }));
+        const r = await api.invoke("check_existing", { outputFolder: folder, items });
+        if (!Array.isArray(r)) throw new Error("no check_existing");
+        found.push(...r);
+      }
+    } catch { found = null; }
+    const byId = new Map((found || []).map((f) => [f.id, f]));
+    for (const j of stale) {
+      if (existKey(j) !== keys.get(j.id)) continue; // changed meanwhile: checked again next time
+      j.existKey = keys.get(j.id);
+      j.existing = byId.get(j.id) || null;
+    }
+    existRun = null;
+    renderAll();
+  })();
+  await existRun;
+}
 
 // Formatting -----------------------------------------------------------------
 
@@ -156,7 +210,7 @@ function renderSettings() {
 // Quality-only jobs are entropy coding, which is bit-serial and runs on the CPU whatever is
 // chosen; only resizing has GPU work. Say which applies to the current queue.
 function anyResize() {
-  const pending = jobs.filter((j) => j.ok && j.state === "waiting");
+  const pending = jobs.filter(toCompress);
   return pending.length ? pending.some((j) => resizes(j, resolutionOf(j))) : settings.resolution !== "original";
 }
 function backendNote() {
@@ -194,7 +248,8 @@ async function addPaths(paths) {
   }
   if (fresh.length) {
     await planTargets();
-    if (running && WEB) await enqueue(fresh.filter((j) => j.ok && j.state === "waiting"));
+    await checkExisting();
+    if (running && WEB) await enqueue(fresh.filter(toCompress), fresh.filter(isAlready));
     renderAll();
     loadThumbs();
   }
@@ -206,8 +261,13 @@ async function again(id) {
   if (running) return;
   const j = jobs.find((x) => x.id === id);
   if (!j || !j.ok) return;
+  if (isAlready(j)) {
+    j.force = true;
+    renderAll();
+    return;
+  }
   if (j.state === "failed" || j.state === "cancelled") {
-    Object.assign(j, { state: "waiting", error: null, fraction: 0, rate: 0 });
+    Object.assign(j, { state: "waiting", error: null, fraction: 0, rate: 0, existKey: null });
     renderAll();
     return;
   }
@@ -301,7 +361,8 @@ function jobCard(j) {
 function updateCard(j) {
   const el = jobCard(j);
   const isPaused = paused && j.state === "running";
-  el.className = `job ${j.state}${isPaused ? " paused" : ""}${viewer.job && viewer.job.id === j.id ? " selected" : ""}`;
+  const already = isAlready(j);
+  el.className = `job ${j.state}${already ? " already" : ""}${isPaused ? " paused" : ""}${viewer.job && viewer.job.id === j.id ? " selected" : ""}`;
   const thumb = el.querySelector(".job-thumb");
   thumb.className = `job-thumb${j.codec === "R3D NE" ? " r3d" : ""}${j.ok ? "" : " bad"}`;
   el.querySelector(".job-codec").textContent = j.ok ? j.codec : "?";
@@ -312,8 +373,8 @@ function updateCard(j) {
   const pill = el.querySelector(".job-pill");
   const pills = { waiting: "Waiting", running: "Compressing", done: "Done", failed: "Failed", cancelled: "Cancelled" };
   const skipped = j.state === "done" && j.result && j.result.skipped;
-  pill.textContent = j.state === "failed" && !j.ok ? "Unreadable" : isPaused ? "Paused" : skipped ? "Already done" : pills[j.state];
-  pill.className = `job-pill ${isPaused ? "paused" : j.state}`;
+  pill.textContent = j.state === "failed" && !j.ok ? "Unreadable" : isPaused ? "Paused" : skipped || already ? "Already done" : pills[j.state];
+  pill.className = `job-pill ${isPaused ? "paused" : already ? "done" : j.state}`;
 
   const meta = el.querySelector(".job-meta");
   if (!j.ok || (j.state === "failed" && j.error)) {
@@ -331,8 +392,15 @@ function updateCard(j) {
 
   const after = el.querySelector(".job-after"), againBtn = el.querySelector(".job-again");
   const finished = j.ok && (j.state === "done" || j.state === "failed" || j.state === "cancelled");
-  after.hidden = !finished;
-  if (finished) {
+  after.hidden = !finished && !already;
+  if (already) {
+    const folder = j.existing.output.split(/[\\/]/).slice(-2, -1)[0] || "";
+    el.querySelector(".job-after-info").innerHTML = `${esc(settingLabel(qualityOf(j), resolutionOf(j)))}<span class="sep">·</span>` +
+      `<span class="job-out" title="${esc(j.existing.output)}">${esc(folder)}/</span>`;
+    againBtn.textContent = "Compress again";
+    againBtn.title = "A compressed copy for this setting already exists, so this clip will be skipped. Compress it anyway to make a new version.";
+    againBtn.disabled = running;
+  } else if (finished) {
     const info = el.querySelector(".job-after-info");
     if (j.state === "done" && j.ran) {
       const folder = j.output ? j.output.split(/[\\/]/).slice(-2, -1)[0] : "";
@@ -363,6 +431,11 @@ function updateCard(j) {
     const left = j.rate > 0 ? (1 - j.fraction) * j.frames / j.rate : NaN;
     sub.textContent = isPaused ? "Paused" : j.rate > 0 ? `${fpsText(j.rate)} fps · ${clock(left)} left` : "Starting";
     fill.style.width = `${j.fraction * 100}%`;
+  } else if (already) {
+    stat.textContent = gb(j.existing.bytes);
+    sub.textContent = "Already compressed";
+    sub.title = `A compressed copy already exists at ${j.existing.output}`;
+    fill.style.width = "100%";
   } else if (skipped) {
     const r = j.result;
     stat.textContent = gb(r.outputBytes);
@@ -433,6 +506,7 @@ function dropJobs(gone) {
 function removeJob(id) {
   const j = jobs.find((x) => x.id === id);
   if (!j || j.state === "running" || (running && !WEB)) return;
+  if (running && j.inRun && j.state === "waiting") batch.total = Math.max(0, batch.total - 1);
   dropJobs([j]);
   if (WEB && j.onServer) api.invoke("remove_jobs", { ids: [id] }).catch(() => {});
   renderAll();
@@ -448,6 +522,7 @@ function clearList() {
     if (WEB) api.invoke("remove_jobs", {}).catch(() => {});
   } else {
     dropJobs(jobs.slice());
+    batch = emptyBatch();
     if (WEB) api.invoke("remove_jobs", { all: true }).catch(() => {});
   }
   renderAll();
@@ -470,12 +545,37 @@ function renderAll() {
   renderSettings();
 }
 
+// Expected output/input size ratio of a clip being compressed, before any clip of the
+// batch has finished: measured in a preview if there is one, else the typical ratio.
+function liveRatio(j) {
+  const q = j.ran ? j.ran.quality : qualityOf(j), r = j.ran ? j.ran.resolution : resolutionOf(j);
+  const m = measured.get(`${j.path}|${q}|${r}`);
+  return m != null ? m : QUALITY[q].keep * areaRatio(j, j.target);
+}
+
 function renderFooter() {
+  scheduleExistingCheck();
   const ok = jobs.filter((j) => j.ok);
-  const waiting = ok.filter((j) => j.state === "waiting");
-  const done = jobs.filter((j) => j.state === "done");
+  const waiting = ok.filter(toCompress);
+  const already = ok.filter(isAlready);
+  const anyDone = ok.filter(alreadyDone);
   const total = ok.reduce((s, j) => s + j.bytes, 0);
-  $("queue-meta").textContent = jobs.length ? `${jobs.length} clip${jobs.length === 1 ? "" : "s"} · ${gb(total)}` : "";
+  const aIn = anyDone.reduce((s, j) => s + alreadyIn(j), 0), aOut = anyDone.reduce((s, j) => s + alreadyOut(j), 0);
+  let meta = "";
+  if (jobs.length) {
+    meta = `${jobs.length} clip${jobs.length === 1 ? "" : "s"}`;
+    if (anyDone.length) {
+      const left = ok.filter((j) => toCompress(j) || j.state === "running").reduce((s, j) => s + j.bytes, 0);
+      meta += ` · ${anyDone.length} already done` + (aIn > aOut ? ` (saved ${gb(aIn - aOut)})` : "") +
+        (left ? ` · ${gb(left)} to compress` : "");
+    } else {
+      meta += ` · ${gb(total)}`;
+    }
+  }
+  $("queue-meta").textContent = meta;
+  $("queue-meta").title = anyDone.length
+    ? "Clips whose compressed copy for their setting already exists are skipped and not counted in the saved-so-far total of a run."
+    : "";
   const clear = $("btn-clear");
   clear.disabled = running ? !jobs.some(isFinished) : jobs.length === 0;
   clear.title = running
@@ -495,30 +595,46 @@ function renderFooter() {
   $("go-icon").innerHTML = running
     ? '<rect x="4" y="4" width="8" height="8" rx="1.5" class="fill"/>'
     : '<path d="M4.5 3.2v9.6L12.5 8 4.5 3.2Z" class="fill"/>';
-  $("go-label").textContent = running ? "Stop" : waiting.length ? `Compress ${waiting.length} clip${waiting.length === 1 ? "" : "s"}` : "Compress";
+  const allDone = !waiting.length && already.length > 0;
+  $("go-label").textContent = running ? "Stop"
+    : waiting.length ? `Compress ${waiting.length} clip${waiting.length === 1 ? "" : "s"}`
+    : allDone ? "All clips already done" : "Compress";
   go.disabled = !running && waiting.length === 0;
 
   const main = $("bar-main"), sub = $("bar-sub"), fill = $("bar-fill");
-  const savedIn = done.reduce((s, j) => s + j.result.inputBytes, 0);
-  const savedOut = done.reduce((s, j) => s + j.result.outputBytes, 0);
+  const pctOf = (saved, base) => (base > 0 ? (saved / base) * 100 : 0);
   if (running) {
     const active = ok.filter((j) => j.inRun);
     const frames = active.reduce((s, j) => s + j.frames, 0);
     const doneFrames = active.reduce((s, j) => s + (j.state === "done" ? j.frames : j.state === "running" ? j.fraction * j.frames : 0), 0);
     const cur = jobs.find((j) => j.state === "running");
-    const idx = active.indexOf(cur) + 1;
     const fps = cur ? cur.rate : 0;
-    main.textContent = paused
-      ? (cur ? `Paused at ${idx} of ${active.length}` : "Paused")
-      : cur ? `Compressing ${idx} of ${active.length}` : "Preparing";
+    // Saved so far: finished clips exactly, plus the part of the current clip already
+    // processed at the ratio measured so far in this batch (or the quality's typical one).
+    const liveIn = cur ? cur.fraction * cur.bytes : 0;
+    // Before a clip of this batch finishes, clips already compressed earlier are the best guess.
+    const ratio = batch.inputBytes > 0 ? batch.outputBytes / batch.inputBytes
+      : aIn > 0 ? aOut / aIn : cur ? liveRatio(cur) : 1;
+    const saved = batch.inputBytes - batch.outputBytes + liveIn * (1 - ratio);
+    const count = `${batch.done} of ${Math.max(batch.total, batch.done)} done`;
+    const lead = paused ? "Paused · " : "";
+    if (saved > 0) {
+      main.innerHTML = `${lead}Saved ${gb(saved)} so far <span class="good">−${pctOf(saved, batch.inputBytes + liveIn).toFixed(1)}%</span> · ${count}`;
+    } else {
+      main.textContent = `${lead}${cur ? "Compressing" : "Preparing"} · ${count}`;
+    }
     sub.textContent = paused
-      ? (cur ? `${cur.name} · ${Math.floor(cur.fraction * 100)}%` : "Resume to continue with the next clip")
-      : fps > 0 ? `${fpsText(fps)} fps · about ${clock((frames - doneFrames) / fps)} left for the queue` : cur ? cur.name : "";
+      ? (cur ? `${cur.name} · ${Math.floor(cur.fraction * 100)}% · paused` : "Resume to continue with the next clip")
+      : cur ? `${cur.name}` + (fps > 0 ? ` · ${fpsText(fps)} fps · about ${clock((frames - doneFrames) / fps)} left for the queue` : "") : "";
     fill.style.width = frames ? `${(doneFrames / frames) * 100}%` : "0";
-  } else if (done.length) {
-    const pct = (1 - savedOut / Math.max(1, savedIn)) * 100;
-    main.innerHTML = `Saved ${gb(savedIn - savedOut)} <span class="good">−${pct.toFixed(1)}%</span>`;
-    sub.textContent = `${done.length} clip${done.length === 1 ? "" : "s"} · ${gb(savedIn)} → ${gb(savedOut)}` +
+  } else if (batch.done > 0) {
+    const savedIn = batch.inputBytes, savedOut = batch.outputBytes;
+    const compressed = batch.done - batch.skipped;
+    main.innerHTML = `Saved ${gb(Math.max(0, savedIn - savedOut))} <span class="good">−${pctOf(savedIn - savedOut, savedIn).toFixed(1)}%</span>` +
+      ` · ${batch.done} of ${Math.max(batch.total, batch.done)} done`;
+    sub.textContent = `${compressed} clip${compressed === 1 ? "" : "s"} compressed · ${gb(savedIn)} → ${gb(savedOut)}` +
+      (batch.skipped ? ` · ${batch.skipped} skipped (already done)` : "") +
+      (batch.failed ? ` · ${batch.failed} failed` : "") +
       (waiting.length ? ` · ${waiting.length} waiting` : "");
     fill.style.width = "0";
   } else if (waiting.length) {
@@ -529,6 +645,10 @@ function renderFooter() {
       ? `Estimated for Q${settings.quality} ${QUALITY[settings.quality].title}` +
         (settings.resolution !== "original" ? ` at ${RES_LABEL[settings.resolution]}` : "")
       : "Estimated with each clip's own settings";
+    fill.style.width = "0";
+  } else if (allDone) {
+    main.textContent = `All ${already.length} clip${already.length === 1 ? " is" : "s are"} already compressed`;
+    sub.textContent = `${gb(aIn)} → ${gb(aOut)} · use Compress again on a clip to make a new version`;
     fill.style.width = "0";
   } else {
     main.textContent = jobs.length ? "Nothing to compress" : "No clips yet";
@@ -542,20 +662,49 @@ function renderFooter() {
 const jobRequest = (j) => ({
   id: j.id, path: j.path, quality: j.ran.quality, resolution: j.ran.resolution, force: !!j.force,
   clip: { name: j.name, codec: j.codec, width: j.width, height: j.height, frames: j.frames, fps: j.fps, bytes: j.bytes },
+  existing: j.alreadyRef || null,
 });
+
+// Clips found already done become done ("Already done") when a run starts, like the ones a
+// run skips. The web server keeps them too, so a reloaded page still shows them.
+function settleAlready(list) {
+  for (const j of list) {
+    j.ran = { quality: qualityOf(j), resolution: resolutionOf(j) };
+    j.alreadyRef = { output: j.existing.output, bytes: j.existing.bytes };
+    j.state = "done";
+    j.output = j.existing.output;
+    j.result = {
+      id: j.id, skipped: true, output: j.existing.output, inputBytes: j.bytes, outputBytes: j.existing.bytes,
+      frames: 0, seconds: 0, fps: 0, backend: "",
+    };
+    j.resultTarget = j.target;
+    j.onServer = WEB;
+  }
+}
 const runSettings = () => ({ backend: settings.backend, outputFolder: settings.dest === "custom" ? settings.outputFolder : null });
 
 async function start() {
-  const todo = jobs.filter((j) => j.ok && j.state === "waiting");
+  await checkExisting();
+  const todo = jobs.filter(toCompress);
   if (!todo.length) return;
-  for (const j of jobs) j.inRun = todo.includes(j);
+  const settled = jobs.filter(isAlready);
+  for (const j of jobs) {
+    j.inRun = todo.includes(j);
+    // The server drops waiting clips that are not in a new batch.
+    if (j.state === "waiting" && !j.inRun) j.onServer = false;
+  }
   for (const j of todo) { j.ran = { quality: qualityOf(j), resolution: resolutionOf(j) }; j.onServer = WEB; }
   running = true;
   paused = false;
+  batch = emptyBatch();
+  batch.total = todo.length;
+  settleAlready(settled);
+  // Only the web server keeps already-done clips; the desktop app gets just the work.
+  const sent = WEB ? jobs.filter((j) => todo.includes(j) || settled.includes(j)) : todo;
   if (viewer.open) closeViewer();
   renderAll();
   try {
-    await api.invoke("start", { jobs: todo.map(jobRequest), settings: runSettings() });
+    await api.invoke("start", { jobs: sent.map(jobRequest), settings: runSettings() });
   } catch (e) {
     running = false;
     renderAll();
@@ -563,11 +712,14 @@ async function start() {
 }
 
 // Web UI only: hands clips added during a run to the server, behind the running ones.
-async function enqueue(todo) {
-  if (!todo.length) return;
+async function enqueue(todo, settled = []) {
+  if (!todo.length && !settled.length) return;
   for (const j of todo) { j.ran = { quality: qualityOf(j), resolution: resolutionOf(j) }; j.inRun = true; j.onServer = true; }
+  batch.total += todo.length;
+  settleAlready(settled);
+  const sent = jobs.filter((j) => todo.includes(j) || settled.includes(j));
   try {
-    await api.invoke("start", { jobs: todo.map(jobRequest), settings: runSettings() });
+    await api.invoke("start", { jobs: sent.map(jobRequest), settings: runSettings() });
   } catch { for (const j of todo) { j.inRun = false; j.onServer = false; } }
 }
 
@@ -602,6 +754,7 @@ async function syncQueue(snap) {
   if (!snap || !Array.isArray(snap.jobs)) return;
   running = !!snap.running;
   paused = !!snap.paused;
+  if (snap.batch) batch = { ...emptyBatch(), ...snap.batch };
   const ids = new Set(snap.jobs.map((s) => s.id));
   dropJobs(jobs.filter((j) => j.onServer && !ids.has(j.id)));
   const added = [];
@@ -650,12 +803,16 @@ function onEvents() {
     updateCard(j); renderFooter();
   });
   api.listen("job-done", (p) => {
-    const j = find(p.id); if (!j) return;
-    j.state = "done"; j.result = p; j.output = p.output; j.resultTarget = j.target;
+    batch.done++;
+    if (p.skipped) batch.skipped++;
+    else { batch.inputBytes += p.inputBytes; batch.outputBytes += p.outputBytes; }
+    const j = find(p.id); if (!j) { renderFooter(); return; }
+    j.state = "done"; j.result = p; j.output = p.output; j.resultTarget = j.target; j.existKey = null;
     updateCard(j); renderFooter();
   });
   api.listen("job-error", (p) => {
-    const j = find(p.id); if (!j) return;
+    if (!p.cancelled) batch.failed++;
+    const j = find(p.id); if (!j) { renderFooter(); return; }
     j.state = p.cancelled ? "cancelled" : "failed";
     j.error = p.cancelled ? null : p.error;
     updateCard(j); renderFooter();
@@ -663,7 +820,8 @@ function onEvents() {
   api.listen("queue-finished", () => {
     running = false;
     paused = false;
-    for (const j of jobs) j.inRun = false;
+    // Outputs written by this run can make other waiting clips already done: check again.
+    for (const j of jobs) { j.inRun = false; if (j.state === "waiting") j.existKey = null; }
     renderAll();
   });
   api.listen("queue-paused", (p) => {
@@ -1441,7 +1599,7 @@ function browserStandIn() {
     onDragDrop: () => {},
     invoke: async (cmd, a) => {
       switch (cmd) {
-        case "app_info": return { version: "0.1.4", gpu: "Metal: Apple GPU", cpu: "CPU (12 threads)", platform: "macos" };
+        case "app_info": return { version: "0.1.5", gpu: "Metal: Apple GPU", cpu: "CPU (12 threads)", platform: "macos" };
         case "is_running": return false;
         case "initial_paths": return location.hash === "#demo" ? ["demo"] : [];
         case "scan": return sample.map(([path, codec, width, height, frames, bytes]) => ({

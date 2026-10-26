@@ -108,6 +108,16 @@ struct JobRequest {
     /// a reloaded page can rebuild its queue.
     #[serde(default)]
     clip: Option<serde_json::Value>,
+    /// Set for a clip the UI found already compressed: it is kept in the queue as done
+    /// (so a reloaded page still shows it) without being part of the batch.
+    #[serde(default)]
+    existing: Option<ExistingRef>,
+}
+
+#[derive(Deserialize, Clone)]
+struct ExistingRef {
+    output: String,
+    bytes: u64,
 }
 
 /// One job of the server-side queue, as returned by `get_queue`.
@@ -137,6 +147,20 @@ struct QueueJob {
 struct QueueState {
     jobs: Vec<QueueJob>,
     settings: Settings,
+    batch: Batch,
+}
+
+/// Running totals of the current batch (since the queue last started from idle), for the
+/// "saved so far" counter. Skipped clips count as done but not towards the bytes.
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct Batch {
+    total: u32,
+    done: u32,
+    skipped: u32,
+    failed: u32,
+    input_bytes: u64,
+    output_bytes: u64,
 }
 
 #[derive(Serialize)]
@@ -145,6 +169,7 @@ struct QueueSnapshot<'a> {
     running: bool,
     paused: bool,
     jobs: &'a [QueueJob],
+    batch: &'a Batch,
 }
 
 #[derive(Deserialize)]
@@ -335,11 +360,7 @@ fn describe_clip(path: &Path) -> Clip {
 }
 
 fn variant(quality: u8, resolution: &str) -> String {
-    match resolution {
-        "6k" => format!("Q{quality} 6K"),
-        "4k" => format!("Q{quality} 4K"),
-        _ => format!("Q{quality}"),
-    }
+    bluecompress::variant_name(quality, resolution)
 }
 
 fn output_for(input: &Path, folder: Option<&str>, quality: u8, resolution: &str) -> PathBuf {
@@ -367,17 +388,48 @@ fn output_for(input: &Path, folder: Option<&str>, quality: u8, resolution: &str)
 /// A finished compressed copy of `input` that an earlier run already wrote for this
 /// setting, if any: the places `output_for` would put it, in the same order.
 fn existing_for(input: &Path, folder: Option<&str>, quality: u8, resolution: &str) -> Option<(PathBuf, u64)> {
-    let tag = variant(quality, resolution);
-    let name = input.file_name()?;
-    let candidates: Vec<PathBuf> = match folder {
-        Some(f) if !f.is_empty() => vec![Path::new(f).join(name), Path::new(f).join(&tag).join(name)],
-        _ => vec![input.parent().unwrap_or(Path::new(".")).join(format!("Compressed {tag}")).join(name)],
-    };
-    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
-        (Ok(x), Ok(y)) => x == y,
-        _ => false,
-    };
-    candidates.into_iter().filter(|p| !same(p, input)).find_map(|p| bluecompress::existing_output(&p).map(|n| (p, n)))
+    bluecompress::existing_compressed(input, folder, quality, resolution)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckExistingItem {
+    id: u64,
+    path: String,
+    quality: u8,
+    resolution: String,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckExistingArgs {
+    output_folder: Option<String>,
+    items: Vec<CheckExistingItem>,
+}
+
+#[derive(Serialize)]
+struct ExistingOutput {
+    id: u64,
+    output: String,
+    bytes: u64,
+}
+
+/// For each clip and its setting, the compressed copy a run would skip because it already
+/// exists. Only file metadata is read, so a folder of hundreds of clips is quick.
+fn check_existing_outputs(folder: Option<&str>, items: &[CheckExistingItem]) -> Vec<ExistingOutput> {
+    items
+        .iter()
+        .filter_map(|it| {
+            let res = bluecompress::effective_resolution(it.width, it.height, &it.resolution);
+            existing_for(Path::new(&it.path), folder, it.quality.clamp(1, 4), res).map(|(p, bytes)| ExistingOutput {
+                id: it.id,
+                output: p.to_string_lossy().into_owned(),
+                bytes,
+            })
+        })
+        .collect()
 }
 
 fn broadcast_event<T: Serialize>(clients: &Mutex<Vec<TcpStream>>, event: &str, payload: T) {
@@ -520,6 +572,7 @@ fn queue_snapshot(state: &ServerState) -> serde_json::Value {
         running: state.running.load(Ordering::SeqCst),
         paused: state.paused.load(Ordering::SeqCst),
         jobs: &q.jobs,
+        batch: &q.batch,
     })
     .unwrap_or(serde_json::Value::Null)
 }
@@ -543,6 +596,9 @@ fn job_error(state: &ServerState, id: u64, error: String, cancelled: bool) {
         j.state = if cancelled { "cancelled".into() } else { "failed".into() };
         j.error = if cancelled { None } else { Some(error.clone()) };
     });
+    if !cancelled {
+        state.queue.lock().unwrap().batch.failed += 1;
+    }
     broadcast_event(&state.sse_clients, "job-error", JobError { id, error, cancelled });
 }
 
@@ -577,10 +633,35 @@ fn start_queue(state: &Arc<ServerState>, args: StartArgs) -> Result<(), String> 
         let running = state.running.load(Ordering::SeqCst);
         if !running {
             q.settings = args.settings.clone();
+            q.batch = Batch::default();
+            // A new batch is exactly what was sent: waiting clips left over from a stopped
+            // run that are not in it (for example ones now already done) are dropped.
+            let ids: Vec<u64> = args.jobs.iter().filter(|j| j.existing.is_none()).map(|j| j.id).collect();
+            q.jobs.retain(|j| j.state != "waiting" || ids.contains(&j.id));
         }
         for job in args.jobs {
             let name = Path::new(&job.path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             let bytes = std::fs::metadata(&job.path).map(|m| m.len()).unwrap_or(0);
+            let counts = job.existing.is_none();
+            let (state_name, fraction, output, result) = match &job.existing {
+                Some(e) => (
+                    "done",
+                    1.0,
+                    Some(e.output.clone()),
+                    Some(JobDone {
+                        id: job.id,
+                        skipped: true,
+                        output: e.output.clone(),
+                        input_bytes: bytes,
+                        output_bytes: e.bytes,
+                        frames: 0,
+                        seconds: 0.0,
+                        fps: 0.0,
+                        backend: String::new(),
+                    }),
+                ),
+                None => ("waiting", 0.0, None, None),
+            };
             let entry = QueueJob {
                 id: job.id,
                 path: job.path,
@@ -590,17 +671,23 @@ fn start_queue(state: &Arc<ServerState>, args: StartArgs) -> Result<(), String> 
                 resolution: job.resolution,
                 force: job.force,
                 clip: job.clip,
-                state: "waiting".into(),
-                fraction: 0.0,
+                state: state_name.into(),
+                fraction,
                 fps: 0.0,
-                output: None,
-                result: None,
+                output,
+                result,
                 error: None,
             };
             match q.jobs.iter_mut().find(|j| j.id == entry.id) {
-                Some(existing) if existing.state != "running" => *existing = entry,
+                Some(existing) if existing.state != "running" => {
+                    *existing = entry;
+                    q.batch.total += u32::from(counts);
+                }
                 Some(_) => {}
-                None => q.jobs.push(entry),
+                None => {
+                    q.jobs.push(entry);
+                    q.batch.total += u32::from(counts);
+                }
             }
         }
     }
@@ -672,6 +759,11 @@ fn run_job(st: &Arc<ServerState>, job: &QueueJob, settings: &Settings) {
                 j.output = Some(done.output.clone());
                 j.result = Some(done.clone());
             });
+            {
+                let mut q = st.queue.lock().unwrap();
+                q.batch.done += 1;
+                q.batch.skipped += 1;
+            }
             broadcast_event(&st.sse_clients, "job-done", done);
             return;
         }
@@ -750,6 +842,12 @@ fn run_job(st: &Arc<ServerState>, job: &QueueJob, settings: &Settings) {
                 j.fraction = 1.0;
                 j.result = Some(done.clone());
             });
+            {
+                let mut q = st.queue.lock().unwrap();
+                q.batch.done += 1;
+                q.batch.input_bytes += done.input_bytes;
+                q.batch.output_bytes += done.output_bytes;
+            }
             broadcast_event(&st.sse_clients, "job-done", done);
         }
         Err(e) => {
@@ -819,6 +917,13 @@ fn invoke_command(state: &Arc<ServerState>, cmd: &str, body: &[u8]) -> HttpRespo
         }
         "is_running" => HttpResponse::json(200, &state.running.load(Ordering::SeqCst)),
         "get_queue" => HttpResponse::json(200, &queue_snapshot(state)),
+        "check_existing" => {
+            let args: CheckExistingArgs = match serde_json::from_slice(body) {
+                Ok(a) => a,
+                Err(e) => return HttpResponse::text(400, &format!("invalid check_existing args: {e}")),
+            };
+            HttpResponse::json(200, &check_existing_outputs(args.output_folder.as_deref(), &args.items))
+        }
         "set_paused" => {
             let args: SetPausedArgs = match serde_json::from_slice(body) {
                 Ok(a) => a,
@@ -836,6 +941,7 @@ fn invoke_command(state: &Arc<ServerState>, cmd: &str, body: &[u8]) -> HttpRespo
             let running = state.running.load(Ordering::SeqCst);
             {
                 let mut q = state.queue.lock().unwrap();
+                let waiting_before = q.jobs.iter().filter(|j| j.state == "waiting").count();
                 q.jobs.retain(|j| {
                     // The clip being compressed always stays; waiting clips only go when
                     // asked by id or, with `all`, while nothing runs.
@@ -847,6 +953,14 @@ fn invoke_command(state: &Arc<ServerState>, cmd: &str, body: &[u8]) -> HttpRespo
                         None => j.state == "waiting" && (running || !args.all),
                     }
                 });
+                // Waiting clips taken out of a running batch no longer count towards it;
+                // emptying the idle list starts the counter afresh.
+                let waiting_after = q.jobs.iter().filter(|j| j.state == "waiting").count();
+                if running {
+                    q.batch.total = q.batch.total.saturating_sub((waiting_before - waiting_after) as u32);
+                } else if q.jobs.is_empty() {
+                    q.batch = Batch::default();
+                }
             }
             let snap = queue_snapshot(state);
             broadcast_event(&state.sse_clients, "queue-changed", &snap);

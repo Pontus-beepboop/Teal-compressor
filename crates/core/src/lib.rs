@@ -206,6 +206,58 @@ pub fn transcode_staged(options: &Options, cancel: &AtomicBool, progress: &mut d
     }
 }
 
+/// Folder tag of a setting, as the queues name output folders: "Q2", "Q3 6K", "Q4 4K".
+pub fn variant_name(quality: u8, resolution: &str) -> String {
+    match resolution {
+        "6k" => format!("Q{quality} 6K"),
+        "4k" => format!("Q{quality} 4K"),
+        _ => format!("Q{quality}"),
+    }
+}
+
+/// The resolution name a job really runs at: "original" when `resolution` ("original",
+/// "6k" or "4k") would not change a `width` x `height` clip, so a 6K setting on a 6K clip
+/// is named like no resize.
+pub fn effective_resolution(width: u32, height: u32, resolution: &str) -> &'static str {
+    let r = match resolution {
+        "6k" => Resolution::K6,
+        "4k" => Resolution::K4,
+        _ => return "original",
+    };
+    if output_size(width, height, r) == (width, height) {
+        "original"
+    } else if r == Resolution::K6 {
+        "6k"
+    } else {
+        "4k"
+    }
+}
+
+/// A finished compressed copy of `input` for this setting (`resolution` as returned by
+/// [`effective_resolution`]), if one exists: the places a queue writes it, in order. Next to
+/// the clips that is `Compressed <tag>/<name>`; in a chosen `folder` it is `<folder>/<name>`
+/// or `<folder>/<tag>/<name>`. Used both to mark clips as already done when they are added
+/// and to skip them at run time.
+pub fn existing_compressed(
+    input: &std::path::Path,
+    folder: Option<&str>,
+    quality: u8,
+    resolution: &str,
+) -> Option<(PathBuf, u64)> {
+    use std::path::Path;
+    let tag = variant_name(quality.clamp(1, 4), resolution);
+    let name = input.file_name()?;
+    let candidates: Vec<PathBuf> = match folder {
+        Some(f) if !f.is_empty() => vec![Path::new(f).join(name), Path::new(f).join(&tag).join(name)],
+        _ => vec![input.parent().unwrap_or(Path::new(".")).join(format!("Compressed {tag}")).join(name)],
+    };
+    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    };
+    candidates.into_iter().filter(|p| !same(p, input)).find_map(|p| existing_output(&p).map(|n| (p, n)))
+}
+
 /// An existing, non-empty compressed copy at `path`, if there is one. Queues use it to skip
 /// clips that an earlier, interrupted run already finished.
 pub fn existing_output(path: &std::path::Path) -> Option<u64> {

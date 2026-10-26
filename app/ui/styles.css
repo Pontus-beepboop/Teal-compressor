@@ -478,6 +478,8 @@ svg .fill { fill: currentColor; stroke: none; }
   overflow: hidden;
 }
 .job.done .job-progress-fill { background: var(--ok); opacity: 0.7; }
+.job.already .job-progress { background: var(--seg-bg); }
+.job.already .job-progress-fill { background: var(--ok); opacity: 0.7; }
 .job.running.paused .job-progress-fill { opacity: 0.5; }
 .job.running.paused .job-progress-fill::after { display: none; }
 

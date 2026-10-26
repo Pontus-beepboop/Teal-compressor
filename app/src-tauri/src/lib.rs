@@ -2,8 +2,8 @@
 //! scans and probes clips, runs jobs one after another on a worker thread, and reports
 //! progress with events.
 //!
-//! Commands: app_info, scan, plan_output, preview, thumbnail, start, cancel, set_paused,
-//! is_running, pick_clips, pick_folder, reveal, initial_paths, confirm_quit.
+//! Commands: app_info, scan, plan_output, preview, thumbnail, check_existing, start, cancel,
+//! set_paused, is_running, pick_clips, pick_folder, reveal, initial_paths, confirm_quit.
 //! Events: job-start {id, output}, job-progress {id, fraction, fps},
 //! job-done {id, skipped, ...outcome}, job-error {id, error, cancelled}, queue-finished {},
 //! queue-paused {paused}, open-paths [paths], quit-requested {}.
@@ -185,11 +185,7 @@ fn describe(path: &Path) -> Clip {
 
 /// Short name of a setting, used for output folders: "Q2", "Q3 6K", "Q1 4K".
 fn variant(quality: u8, resolution: &str) -> String {
-    match resolution {
-        "6k" => format!("Q{quality} 6K"),
-        "4k" => format!("Q{quality} 4K"),
-        _ => format!("Q{quality}"),
-    }
+    bluecompress::variant_name(quality, resolution)
 }
 
 /// Where a job writes. Clips keep their file names, so edits relink; the setting goes in
@@ -302,17 +298,7 @@ async fn thumbnail(path: String, width: u32) -> Result<tauri::ipc::Response, Str
 /// A compressed copy of `input` for this setting that an earlier run already finished, if
 /// any: the places `output_for` would put it, in the same order.
 fn existing_for(input: &Path, folder: Option<&str>, quality: u8, resolution: &str) -> Option<(PathBuf, u64)> {
-    let tag = variant(quality, resolution);
-    let name = input.file_name()?;
-    let candidates: Vec<PathBuf> = match folder {
-        Some(f) if !f.is_empty() => vec![Path::new(f).join(name), Path::new(f).join(&tag).join(name)],
-        _ => vec![input.parent().unwrap_or(Path::new(".")).join(format!("Compressed {tag}")).join(name)],
-    };
-    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
-        (Ok(x), Ok(y)) => x == y,
-        _ => false,
-    };
-    candidates.into_iter().filter(|p| !same(p, input)).find_map(|p| engine::existing_output(&p).map(|n| (p, n)))
+    bluecompress::existing_compressed(input, folder, quality, resolution)
 }
 
 /// Seconds a finished clip actually spent compressing, without the time it was paused.
@@ -328,6 +314,45 @@ fn active_fps(frames: u32, seconds: f64, fps: f64, paused_for: std::time::Durati
     } else {
         f64::from(frames) / s
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckExistingItem {
+    id: u64,
+    path: String,
+    quality: u8,
+    resolution: String,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Serialize)]
+struct ExistingOutput {
+    id: u64,
+    output: String,
+    bytes: u64,
+}
+
+/// For each clip and its setting, the compressed copy a run would skip because it already
+/// exists. Only file metadata is read, so a folder of hundreds of clips is quick.
+fn check_existing_outputs(folder: Option<&str>, items: &[CheckExistingItem]) -> Vec<ExistingOutput> {
+    items
+        .iter()
+        .filter_map(|it| {
+            let res = bluecompress::effective_resolution(it.width, it.height, &it.resolution);
+            existing_for(Path::new(&it.path), folder, it.quality.clamp(1, 4), res).map(|(p, bytes)| ExistingOutput {
+                id: it.id,
+                output: p.to_string_lossy().into_owned(),
+                bytes,
+            })
+        })
+        .collect()
+}
+
+#[tauri::command(async)]
+fn check_existing(output_folder: Option<String>, items: Vec<CheckExistingItem>) -> Vec<ExistingOutput> {
+    check_existing_outputs(output_folder.as_deref(), &items)
 }
 
 /// Blocks while the queue is paused. Returns false when it was cancelled meanwhile.
@@ -550,6 +575,7 @@ pub fn run() {
             start,
             cancel,
             set_paused,
+            check_existing,
             is_running,
             pick_clips,
             pick_folder,

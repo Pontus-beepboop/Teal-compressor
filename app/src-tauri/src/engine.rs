@@ -1,7 +1,7 @@
 //! The engine the app drives: the real core, or (feature `mock`) a stand-in with realistic
 //! numbers for working on the interface without decoding anything.
 
-pub use bluecompress::{existing_output, Backend, Codec, Options, Resolution};
+pub use bluecompress::{Backend, Codec, Options, Resolution};
 
 #[cfg(not(feature = "mock"))]
 pub use bluecompress::{backend_description, output_size, preview_region, probe, thumbnail, transcode_staged};
