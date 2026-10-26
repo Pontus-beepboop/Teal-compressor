@@ -1,3 +1,9 @@
+**What's new in 0.1.4**
+- Pause and resume the queue. Pause holds the clip being compressed where it is, and Resume continues it; Stop still cancels, also while paused. Works in the desktop app and the Web UI.
+- Clear List button: empties the whole list when nothing is running; while compressing it removes only the finished clips.
+- Safer, resumable batches: each clip is written to a temporary file and renamed only when it is complete, so an interrupted run (crash, NAS or container restart) never leaves a broken clip under the final name. Clips whose compressed copy for the same setting already exists are skipped and shown as "Already done", so adding the same folder again after an interruption only compresses what is left. Compress again still makes a new version on purpose.
+- Docker and Web UI: the queue now lives on the server. Reloading or closing the page no longer loses it; the page restores the clips, progress and pause state, and you can add more clips while it runs. Pausing a Web UI job lets the watch folder keep working in the meantime.
+
 **What's new in 0.1.3**
 - AMD (OpenCL) and NVIDIA (CUDA) GPU acceleration is now enabled in both the Windows and Linux desktop app and the command line tool when downsizing to 6K or 4K, with automatic fallback to the CPU when no supported GPU or runtime is present. Both GPU paths now use a double-precision transfer curve and disable FMA contraction where the CPU does, matching CPU output bit for bit.
 - Validated CUDA support on Windows 11 (RTX 4060 Ti), clearer error reporting and documentation for the NVRTC 12.x runtime requirement on Windows, and a CUDA kernel compile and load test (thanks to @Lucke-bp in PR #2).
