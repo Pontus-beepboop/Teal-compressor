@@ -1,3 +1,7 @@
+**What's new in 0.1.5**
+- Already-compressed clips are detected up front: when clips or folders are added, and again when the quality, resolution or output folder changes, clips whose compressed copy for that setting already exists are marked "Already done" right away. They are left out of the Compress button count (for example "Compress 304 clips"), the queue header shows how many are already done and how much they saved, and when everything is done the button says so. Compress again still forces a new version, and the run-time skip stays as a safety net.
+- Live "saved so far" counter for the current batch, for example "Saved 412 GB so far -38% · 85 of 304 done", while running and after it finishes. Finished clips count exactly and the clip in progress is estimated; clips that were already done are counted separately in the queue header. In the Web UI the counter and the already-done clips survive a page reload.
+
 **What's new in 0.1.4**
 - Pause and resume the queue. Pause holds the clip being compressed where it is, and Resume continues it; Stop still cancels, also while paused. Works in the desktop app and the Web UI.
 - Clear List button: empties the whole list when nothing is running; while compressing it removes only the finished clips.
