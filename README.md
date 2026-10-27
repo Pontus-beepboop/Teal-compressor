@@ -39,6 +39,15 @@ on such a clip to force a new version. While a queue runs, the footer shows the 
 so far by this batch (finished clips exactly, the clip in progress estimated) and how many
 clips are done; clips that were already done are counted separately in the queue header.
 
+**Deleting originals.** Once clips have a compressed copy, **Delete Originals** in the queue
+header removes their camera originals in one go, and the **Delete after compressing** switch
+(under Originals in the settings) does it automatically after each clip, including clips that
+were already done. An original is only removed after its compressed copy has been checked: it
+has to open, with the same codec, frame count and number of audio tracks as the original; if
+the check fails, the original is kept and the clip says why. The desktop app moves originals to
+the Trash (or Recycle Bin) by default, or deletes them permanently if you choose so. The Web UI
+has no Trash, so there it is always permanent, and only files under the browse root are touched.
+
 ![Blue Compressor desktop app](docs/screenshot.png)
 
 > **Status: early and experimental.** It has been tested on one Z8 clip and one ZR clip,

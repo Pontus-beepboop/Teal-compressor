@@ -264,6 +264,48 @@ pub fn existing_output(path: &std::path::Path) -> Option<u64> {
     std::fs::metadata(path).ok().filter(|m| m.is_file() && m.len() > 0).map(|m| m.len())
 }
 
+/// Checks that `compressed` is a complete, readable compressed copy of `original`, so the
+/// original can be deleted: a different, non-empty file whose container opens, with the same
+/// codec, frame count and number of audio tracks. Resizing changes the frame size, so that is
+/// not compared. Only the containers are read, so this is quick even for large clips.
+pub fn verify_compressed(original: &std::path::Path, compressed: &std::path::Path) -> Result<ClipInfo> {
+    let same = match (original.canonicalize(), compressed.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        (_, Err(e)) => return Err(Error(format!("compressed copy not found at {}: {e}", compressed.display()))),
+        (Err(e), _) => return Err(Error(format!("original not found at {}: {e}", original.display()))),
+    };
+    if same {
+        return Err(Error("the compressed copy is the original itself".into()));
+    }
+    if existing_output(compressed).is_none() {
+        return Err(Error(format!("compressed copy at {} is empty", compressed.display())));
+    }
+    let src = probe(original).map_err(|e| Error(format!("cannot read the original: {e}")))?;
+    let out = probe(compressed).map_err(|e| Error(format!("cannot read the compressed copy: {e}")))?;
+    if src.codec != out.codec {
+        return Err(Error("the compressed copy has a different codec".into()));
+    }
+    if src.frames != out.frames {
+        return Err(Error(format!("the compressed copy has {} frames, the original {}", out.frames, src.frames)));
+    }
+    if src.audio_tracks != out.audio_tracks {
+        return Err(Error(format!(
+            "the compressed copy has {} audio tracks, the original {}",
+            out.audio_tracks, src.audio_tracks
+        )));
+    }
+    Ok(src)
+}
+
+/// Deletes `original` permanently after [`verify_compressed`] passed for `compressed`.
+/// Returns the number of bytes freed. Front ends that can move files to the system Trash do
+/// that themselves after verifying.
+pub fn delete_original(original: &std::path::Path, compressed: &std::path::Path) -> Result<u64> {
+    let info = verify_compressed(original, compressed)?;
+    std::fs::remove_file(original).map_err(|e| Error(format!("cannot delete {}: {e}", original.display())))?;
+    Ok(info.file_bytes)
+}
+
 /// Renders frame `frame` (clamped) of the clip before and after compression with the given
 /// quality and resolution, as a simple debayered preview `width` pixels wide. Both halves
 /// go through the same rendering, so differences come from compression alone.

@@ -4,10 +4,14 @@
 pub use bluecompress::{Backend, Codec, Options, Resolution};
 
 #[cfg(not(feature = "mock"))]
-pub use bluecompress::{backend_description, output_size, preview_region, probe, thumbnail, transcode_staged};
+pub use bluecompress::{
+    backend_description, output_size, preview_region, probe, thumbnail, transcode_staged, verify_compressed,
+};
 
 #[cfg(feature = "mock")]
-pub use mock::{backend_description, output_size, preview_region, probe, thumbnail, transcode_staged};
+pub use mock::{
+    backend_description, output_size, preview_region, probe, thumbnail, transcode_staged, verify_compressed,
+};
 
 #[cfg(feature = "mock")]
 mod mock {
@@ -189,6 +193,12 @@ mod mock {
     pub fn thumbnail(path: &Path, frame: u32, width: u32) -> bluecompress::Result<Thumbnail> {
         let p = preview_region(path, frame, 1, Resolution::Original, Backend::Cpu, [0.0, 0.0, 1.0, 1.0], width)?;
         Ok(Thumbnail { width: p.width, height: p.height, rgba: p.before_rgba })
+    }
+
+    /// The mock writes no compressed files, so there is never a copy to check against and
+    /// originals are never deleted.
+    pub fn verify_compressed(_original: &Path, _compressed: &Path) -> bluecompress::Result<ClipInfo> {
+        Err(bluecompress::Error("mock engine: originals are never deleted".into()))
     }
 
     /// The mock writes no files, so staging is the same as a plain run.
