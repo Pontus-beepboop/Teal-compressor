@@ -39,7 +39,10 @@ const resizes = (j, r) => r !== "original" && !(r === "6k" && j.width <= 6060) &
 const settingLabel = (q, r) => `Q${q} ${QUALITY[q].title}${r !== "original" ? " · " + RES_LABEL[r] : ""}`;
 
 const settings = Object.assign(
-  { resolution: "original", quality: 2, backend: "gpu", outputFolder: null, dest: "next", sameForAll: true },
+  {
+    resolution: "original", quality: 2, backend: "gpu", outputFolder: null, dest: "next", sameForAll: true,
+    deleteOriginals: false, deleteMode: "trash",
+  },
   readSettings(),
 );
 let jobs = [];
@@ -48,7 +51,9 @@ let running = false;
 let paused = false;
 // Totals of the current batch for the "saved so far" counter. Clips skipped at run time
 // because their output already existed count as done, not towards the bytes.
-const emptyBatch = () => ({ total: 0, done: 0, skipped: 0, failed: 0, inputBytes: 0, outputBytes: 0 });
+const emptyBatch = () => ({
+  total: 0, done: 0, skipped: 0, failed: 0, inputBytes: 0, outputBytes: 0, deleted: 0, freed: 0, keptOriginals: 0,
+});
 let batch = emptyBatch();
 let info = { gpu: "", cpu: "", platform: "" };
 const els = new Map(); // job id -> card element
@@ -76,6 +81,21 @@ const alreadyIn = (j) => j.bytes;
 const alreadyOut = (j) => (j.existing && j.state === "waiting" ? j.existing.bytes : j.result.outputBytes);
 const toCompress = (j) => j.ok && j.state === "waiting" && !isAlready(j);
 const needsCheck = (j) => j.ok && j.state === "waiting" && !j.force && j.existKey !== existKey(j);
+
+// Deleting originals: by hand with Delete Originals, or after each clip with the setting on.
+// Either way the backend checks the compressed copy (it opens, same codec, frames and audio)
+// before the original goes. The web server has no Trash, so there it is always permanent.
+const delMode = () => (WEB ? "permanent" : settings.deleteMode === "permanent" ? "permanent" : "trash");
+// Clips with a finished compressed copy whose original is still there.
+const hasCopy = (j) => j.ok && !j.originalGone && ((j.state === "done" && !!j.output) || isAlready(j));
+const copyOf = (j) => (j.state === "done" ? j.output : j.existing.output);
+// What happened to the original, for the card.
+function goneText(j) {
+  if (j.originalGone) return j.originalGone.trashed ? "Original in Trash" : "Original deleted";
+  return j.deleteError ? "Original kept" : "";
+}
+// The result of the last Delete Originals, shown in the footer until the next run.
+let lastDelete = null;
 
 let existTimer = 0;
 let existRun = null;
@@ -202,6 +222,18 @@ function renderSettings() {
       ? `In a “Compressed ${variantName(settings.quality, settings.resolution)}” folder beside each clip.`
       : "In a “Compressed Q…” folder beside each clip, named after its setting.";
   }
+  const delOn = !!settings.deleteOriginals;
+  $("del-auto").checked = delOn;
+  $("del-auto").disabled = running;
+  $("del-auto-sub").textContent = !delOn ? "Originals are kept"
+    : delMode() === "trash" ? "Each original goes to the Trash once its copy checks out"
+    : "Each original is deleted once its copy checks out";
+  $("seg-del-mode").hidden = !delOn;
+  setSeg("seg-del-mode", settings.deleteMode === "permanent" ? "permanent" : "trash", running);
+  $("del-note").className = `hint${delOn ? " on" : ""}`;
+  $("del-note").textContent = delOn
+    ? (delMode() === "trash" ? "The Trash frees the space once you empty it." : "Deleted originals cannot be restored.")
+    : "";
   const chip = $("engine-chip");
   chip.classList.toggle("cpu", settings.backend === "cpu");
   $("engine-text").textContent = settings.backend === "cpu" || !info.gpuAvailable ? (info.cpu || "CPU") : (info.gpu || "GPU");
@@ -260,7 +292,7 @@ async function addPaths(paths) {
 async function again(id) {
   if (running) return;
   const j = jobs.find((x) => x.id === id);
-  if (!j || !j.ok) return;
+  if (!j || !j.ok || j.originalGone) return;
   if (isAlready(j)) {
     j.force = true;
     renderAll();
@@ -290,7 +322,7 @@ const thumbs = new Map(); // path -> ImageBitmap | "pending" | "failed"
 let thumbsBusy = false;
 async function loadThumbs() {
   if (thumbsBusy) return;
-  const j = jobs.find((x) => x.ok && !thumbs.has(x.path));
+  const j = jobs.find((x) => x.ok && !x.originalGone && !thumbs.has(x.path));
   if (!j) return;
   thumbsBusy = true;
   thumbs.set(j.path, "pending");
@@ -353,7 +385,7 @@ function jobCard(j) {
   rSel.addEventListener("change", async () => {
     const x = job(); x.resolution = rSel.value; x.target = await targetFor(x, x.resolution); updateCard(x); renderFooter();
   });
-  el.addEventListener("click", () => { const x = job(); if (x.ok) openViewer(x); });
+  el.addEventListener("click", () => { const x = job(); if (x.ok && !x.originalGone) openViewer(x); });
   els.set(j.id, el);
   return el;
 }
@@ -362,13 +394,14 @@ function updateCard(j) {
   const el = jobCard(j);
   const isPaused = paused && j.state === "running";
   const already = isAlready(j);
-  el.className = `job ${j.state}${already ? " already" : ""}${isPaused ? " paused" : ""}${viewer.job && viewer.job.id === j.id ? " selected" : ""}`;
+  el.className = `job ${j.state}${already ? " already" : ""}${isPaused ? " paused" : ""}${j.originalGone ? " gone" : ""}` +
+    `${viewer.job && viewer.job.id === j.id ? " selected" : ""}`;
   const thumb = el.querySelector(".job-thumb");
   thumb.className = `job-thumb${j.codec === "R3D NE" ? " r3d" : ""}${j.ok ? "" : " bad"}`;
   el.querySelector(".job-codec").textContent = j.ok ? j.codec : "?";
   drawThumb(j);
   el.querySelector(".job-name").textContent = j.name;
-  el.title = j.ok ? `${j.path}\nClick to preview the quality` : j.path;
+  el.title = j.originalGone ? `${j.path}\n${goneText(j)}` : j.ok ? `${j.path}\nClick to preview the quality` : j.path;
 
   const pill = el.querySelector(".job-pill");
   const pills = { waiting: "Waiting", running: "Compressing", done: "Done", failed: "Failed", cancelled: "Cancelled" };
@@ -416,6 +449,21 @@ function updateCard(j) {
     againBtn.disabled = running;
     if (skipped) againBtn.title = "A compressed copy was already there, so this clip was skipped. Add it again to make a new version.";
   }
+  const gone = goneText(j);
+  if (gone && !after.hidden) {
+    const span = document.createElement("span");
+    span.className = `job-gone${j.originalGone ? "" : " err"}`;
+    span.textContent = gone;
+    span.title = j.originalGone
+      ? (j.originalGone.trashed ? "The original clip was moved to the Trash after its compressed copy was checked."
+        : "The original clip was deleted after its compressed copy was checked.")
+      : j.deleteError || "";
+    const sep = document.createElement("span");
+    sep.className = "sep";
+    sep.textContent = "·";
+    el.querySelector(".job-after-info").append(sep, span);
+  }
+  againBtn.hidden = !!j.originalGone;
 
   const qSel = el.querySelector(".job-q"), rSel = el.querySelector(".job-r");
   qSel.value = String(j.quality);
@@ -470,7 +518,7 @@ function updateCard(j) {
   }
   el.querySelector(".job-reveal").hidden = !(j.state === "done" || j.ok);
   el.querySelector(".job-reveal").title = j.state === "done" ? `${revealLabel()} (compressed copy)` : revealLabel();
-  el.querySelector(".job-preview").hidden = !j.ok;
+  el.querySelector(".job-preview").hidden = !j.ok || !!j.originalGone;
   el.querySelector(".job-remove").hidden = running && !(WEB && j.state !== "running");
 }
 
@@ -582,6 +630,14 @@ function renderFooter() {
     ? "Removes finished clips. The clip being compressed and the waiting ones stay until the queue is done or stopped."
     : "Removes every clip from the list. Compressed files are kept.";
   $("btn-add").disabled = $("btn-add-folder").disabled = !canAdd();
+  const del = $("btn-del"), withCopy = ok.filter(hasCopy);
+  del.hidden = !withCopy.length;
+  del.disabled = running;
+  $("btn-del-label").textContent = `Delete ${withCopy.length} Original${withCopy.length === 1 ? "" : "s"}`;
+  del.title = running
+    ? "Available when the queue is done"
+    : `Deletes the original clips that have a finished compressed copy (${gb(withCopy.reduce((s, j) => s + j.bytes, 0))}). ` +
+      "Each copy is checked first.";
   const pause = $("btn-pause");
   pause.hidden = !running;
   $("pause-label").textContent = paused ? "Resume" : "Pause";
@@ -616,7 +672,8 @@ function renderFooter() {
     const ratio = batch.inputBytes > 0 ? batch.outputBytes / batch.inputBytes
       : aIn > 0 ? aOut / aIn : cur ? liveRatio(cur) : 1;
     const saved = batch.inputBytes - batch.outputBytes + liveIn * (1 - ratio);
-    const count = `${batch.done} of ${Math.max(batch.total, batch.done)} done`;
+    const count = `${batch.done} of ${Math.max(batch.total, batch.done)} done` +
+      (batch.deleted ? ` · ${batch.deleted} original${batch.deleted === 1 ? "" : "s"} deleted` : "");
     const lead = paused ? "Paused · " : "";
     if (saved > 0) {
       main.innerHTML = `${lead}Saved ${gb(saved)} so far <span class="good">−${pctOf(saved, batch.inputBytes + liveIn).toFixed(1)}%</span> · ${count}`;
@@ -635,6 +692,9 @@ function renderFooter() {
     sub.textContent = `${compressed} clip${compressed === 1 ? "" : "s"} compressed · ${gb(savedIn)} → ${gb(savedOut)}` +
       (batch.skipped ? ` · ${batch.skipped} skipped (already done)` : "") +
       (batch.failed ? ` · ${batch.failed} failed` : "") +
+      (batch.deleted ? ` · ${batch.deleted} original${batch.deleted === 1 ? "" : "s"} ` +
+        `${delMode() === "trash" ? "moved to the Trash" : "deleted"} (${gb(batch.freed)})` : "") +
+      (batch.keptOriginals ? ` · ${batch.keptOriginals} original${batch.keptOriginals === 1 ? "" : "s"} kept, see the clips` : "") +
       (waiting.length ? ` · ${waiting.length} waiting` : "");
     fill.style.width = "0";
   } else if (waiting.length) {
@@ -645,6 +705,9 @@ function renderFooter() {
       ? `Estimated for Q${settings.quality} ${QUALITY[settings.quality].title}` +
         (settings.resolution !== "original" ? ` at ${RES_LABEL[settings.resolution]}` : "")
       : "Estimated with each clip's own settings";
+    if (settings.deleteOriginals) {
+      sub.textContent += delMode() === "trash" ? " · originals go to the Trash after each clip" : " · originals are deleted after each clip";
+    }
     fill.style.width = "0";
   } else if (allDone) {
     main.textContent = `All ${already.length} clip${already.length === 1 ? " is" : "s are"} already compressed`;
@@ -654,6 +717,13 @@ function renderFooter() {
     main.textContent = jobs.length ? "Nothing to compress" : "No clips yet";
     sub.textContent = jobs.length ? "Add clips or clear the finished ones" : "Add clips to see the estimated savings";
     fill.style.width = "0";
+  }
+  if (!running && lastDelete) {
+    const d = lastDelete;
+    const parts = [];
+    if (d.count) parts.push(`${d.count} original${d.count === 1 ? "" : "s"} ${d.trashed ? "moved to the Trash" : "deleted"} (${gb(d.bytes)})`);
+    if (d.failed) parts.push(`${d.failed} kept because ${d.failed === 1 ? "its copy" : "their copies"} did not check out, see the clips`);
+    sub.textContent = parts.join(" · ");
   }
 }
 
@@ -681,7 +751,10 @@ function settleAlready(list) {
     j.onServer = WEB;
   }
 }
-const runSettings = () => ({ backend: settings.backend, outputFolder: settings.dest === "custom" ? settings.outputFolder : null });
+const runSettings = () => ({
+  backend: settings.backend, outputFolder: settings.dest === "custom" ? settings.outputFolder : null,
+  deleteOriginals: !!settings.deleteOriginals, deleteMode: delMode(),
+});
 
 async function start() {
   await checkExisting();
@@ -696,6 +769,7 @@ async function start() {
   for (const j of todo) { j.ran = { quality: qualityOf(j), resolution: resolutionOf(j) }; j.onServer = WEB; }
   running = true;
   paused = false;
+  lastDelete = null;
   batch = emptyBatch();
   batch.total = todo.length;
   settleAlready(settled);
@@ -723,6 +797,131 @@ async function enqueue(todo, settled = []) {
   } catch { for (const j of todo) { j.inRun = false; j.onServer = false; } }
 }
 
+// What a finished clip's result says about its original.
+function noteDeleted(j, r) {
+  if (r.originalDeleted) { j.originalGone = { trashed: !!r.originalTrashed }; j.deleteError = null; }
+  else if (r.deleteError) j.deleteError = r.deleteError;
+}
+
+// A confirmation dialog. `buttons` are [{ label, value, kind }] after Cancel; resolves to the
+// chosen value, or null for Cancel and Escape.
+let dialogResolve = null;
+function confirmDialog({ title, text, fine, buttons }) {
+  $("del-title").textContent = title;
+  $("del-text").textContent = text;
+  $("del-fine").textContent = fine || "";
+  $("del-fine").hidden = !fine;
+  const row = $("del-modal").querySelector(".modal-buttons");
+  row.innerHTML = "";
+  const close = (v) => {
+    $("del-modal").classList.remove("show");
+    const fn = dialogResolve;
+    dialogResolve = null;
+    if (fn) fn(v);
+  };
+  for (const b of [{ label: "Cancel", value: null, kind: "ghost" }, ...buttons]) {
+    const el = document.createElement("button");
+    el.className = `btn ${b.kind}`;
+    el.textContent = b.label;
+    el.addEventListener("click", () => close(b.value));
+    row.append(el);
+  }
+  if (dialogResolve) dialogResolve(null);
+  return new Promise((resolve) => {
+    dialogResolve = resolve;
+    $("del-modal").classList.add("show");
+    row.lastElementChild.focus();
+  });
+}
+function closeDialog() {
+  if (!dialogResolve) return false;
+  $("del-modal").classList.remove("show");
+  const fn = dialogResolve;
+  dialogResolve = null;
+  fn(null);
+  return true;
+}
+
+const CHECK_TEXT = "Each original is only removed after its compressed copy has been checked: " +
+  "it has to open, with the same codec, frame count and audio tracks. If a check fails, that original is kept.";
+const BETA_FINE = "Blue Compressor is beta software. Open a few compressed copies in your own software " +
+  "before you rely on them.";
+
+// Delete Originals: removes the originals of every clip with a finished compressed copy.
+async function deleteOriginals() {
+  if (running) return;
+  const list = jobs.filter(hasCopy);
+  if (!list.length) return;
+  const bytes = list.reduce((s, j) => s + j.bytes, 0);
+  const n = list.length, many = n === 1 ? "" : "s";
+  const buttons = WEB
+    ? [{ label: "Delete Permanently", value: "permanent", kind: "danger" }]
+    : [
+      { label: "Delete Permanently", value: "permanent", kind: "danger" },
+      { label: "Move to Trash", value: "trash", kind: "primary" },
+    ];
+  const mode = await confirmDialog({
+    title: `Delete ${n} original clip${many}?`,
+    text: `${gb(bytes)} of camera originals that already have a compressed copy. ` + CHECK_TEXT +
+      (WEB ? " This server has no Trash, so they cannot be restored." : " The Trash frees the space once you empty it."),
+    fine: BETA_FINE,
+    buttons,
+  });
+  if (!mode) return;
+  const items = list.map((j) => ({ id: j.id, path: j.path, output: copyOf(j) }));
+  const btn = $("btn-del");
+  btn.disabled = true;
+  $("btn-del-label").textContent = "Deleting…";
+  let results = [];
+  try {
+    results = await api.invoke("delete_originals", { items, permanent: mode === "permanent" });
+  } catch (e) {
+    results = items.map((it) => ({ id: it.id, ok: false, error: String(e && e.message ? e.message : e) }));
+  }
+  const byId = new Map((results || []).map((r) => [r.id, r]));
+  lastDelete = { count: 0, bytes: 0, failed: 0, trashed: mode === "trash" };
+  for (const j of list) {
+    const r = byId.get(j.id);
+    if (r && r.ok) {
+      // A clip found already done becomes done, like when a run skips it.
+      if (isAlready(j)) { settleAlready([j]); j.onServer = false; }
+      j.originalGone = { trashed: !!r.trashed };
+      j.deleteError = null;
+      lastDelete.count++;
+      lastDelete.bytes += r.bytes || j.bytes;
+      if (viewer.job && viewer.job.id === j.id) closeViewer();
+    } else {
+      j.deleteError = (r && r.error) || "not deleted";
+      lastDelete.failed++;
+    }
+  }
+  renderAll();
+}
+
+// Turning on "Delete after compressing" asks first; so does switching it to permanent.
+async function setAutoDelete(on, mode = delMode()) {
+  if (!on) {
+    settings.deleteOriginals = false;
+    saveSettings();
+    renderAll();
+    return;
+  }
+  const how = mode === "trash" ? "moved to the Trash" : "deleted permanently";
+  const ok = await confirmDialog({
+    title: mode === "trash" ? "Move originals to the Trash after compressing?" : "Delete originals permanently after compressing?",
+    text: `After each clip is compressed, its original is ${how}. Clips that are already compressed are included. ` +
+      CHECK_TEXT + (mode === "permanent" ? " Permanently deleted clips cannot be restored." : ""),
+    fine: BETA_FINE,
+    buttons: [{ label: "Turn On", value: true, kind: mode === "permanent" ? "danger" : "primary" }],
+  });
+  if (ok) {
+    settings.deleteOriginals = true;
+    if (!WEB) settings.deleteMode = mode;
+  }
+  saveSettings();
+  renderAll();
+}
+
 function stop() { api.invoke("cancel"); }
 
 async function togglePause() {
@@ -747,6 +946,8 @@ function fromServer(s) {
     id: s.id, state: s.state, fraction: s.fraction, rate: s.fps, target: null, force: s.force,
     quality: s.quality, resolution: s.resolution, ran: { quality: s.quality, resolution: s.resolution },
     output: s.output, result: s.result, onServer: true,
+    originalGone: s.result && s.result.originalDeleted ? { trashed: false } : null,
+    deleteError: s.result ? s.result.deleteError || null : null,
   };
 }
 
@@ -769,6 +970,7 @@ async function syncQueue(snap) {
         state: s.state, fraction: s.fraction, rate: s.fps, error: s.error, onServer: true,
         output: s.output || j.output, result: s.result || j.result,
       });
+      if (s.result) noteDeleted(j, s.result);
     }
     // Finished clips of a restored run still count towards "n of m" in the footer.
     const isNew = added.includes(j);
@@ -808,6 +1010,9 @@ function onEvents() {
     else { batch.inputBytes += p.inputBytes; batch.outputBytes += p.outputBytes; }
     const j = find(p.id); if (!j) { renderFooter(); return; }
     j.state = "done"; j.result = p; j.output = p.output; j.resultTarget = j.target; j.existKey = null;
+    noteDeleted(j, p);
+    if (p.originalDeleted) { batch.deleted++; batch.freed += j.bytes; }
+    if (p.deleteError) batch.keptOriginals++;
     updateCard(j); renderFooter();
   });
   api.listen("job-error", (p) => {
@@ -1519,6 +1724,20 @@ async function init() {
   $("empty-add").addEventListener("click", pickClips);
   $("empty-add-folder").addEventListener("click", pickFolder);
   $("btn-clear").addEventListener("click", clearList);
+  $("btn-del").addEventListener("click", deleteOriginals);
+  $("del-auto").addEventListener("change", (e) => {
+    const on = e.target.checked;
+    e.target.checked = !!settings.deleteOriginals; // until confirmed
+    setAutoDelete(on);
+  });
+  $("seg-del-mode").addEventListener("click", (e) => {
+    const b = e.target.closest("button");
+    if (!b || running || b.dataset.value === settings.deleteMode) return;
+    if (b.dataset.value === "permanent" && settings.deleteOriginals) { setAutoDelete(true, "permanent"); return; }
+    settings.deleteMode = b.dataset.value;
+    saveSettings();
+    renderAll();
+  });
   $("btn-pause").addEventListener("click", togglePause);
   $("btn-go").addEventListener("click", () => (running ? stop() : start()));
   $("quit-cancel").addEventListener("click", () => $("quit-modal").classList.remove("show"));
@@ -1533,7 +1752,7 @@ async function init() {
   document.addEventListener("keydown", (e) => {
     const mod = e.metaKey || e.ctrlKey;
     if (mod && e.key.toLowerCase() === "o") { e.preventDefault(); e.shiftKey ? pickFolder() : pickClips(); }
-    if (e.key === "Escape") $("quit-modal").classList.remove("show");
+    if (e.key === "Escape") { closeDialog(); $("quit-modal").classList.remove("show"); }
   });
   document.addEventListener("contextmenu", (e) => e.preventDefault());
   bindViewer();
@@ -1620,6 +1839,7 @@ function browserStandIn() {
           out.set(p.subarray(0, 8)); out.set(p.subarray(32, 32 + w * h * 4), 8);
           return out.buffer;
         }
+        case "delete_originals": return a.items.map((it) => ({ id: it.id, ok: true, trashed: !a.permanent, bytes: 2.6e9, error: null }));
         case "pick_clips": return ["demo"];
         case "pick_folder": return "/Volumes/Archive/Compressed";
         case "cancel": cancel = true; paused = false; return;
@@ -1639,7 +1859,11 @@ function browserStandIn() {
                 emit("job-progress", { id: j.id, fraction: i / total, fps: 38 + Math.random() * 4 });
               }
               if (cancel) { emit("job-error", { id: j.id, error: "cancelled", cancelled: true }); break; }
-              emit("job-done", { id: j.id, skipped: false, output: j.path, inputBytes: 2.6e9, outputBytes: 2.12e9, frames: 360, seconds: 9.1, fps: 39.6, backend: "CPU" });
+              const del = a.settings && a.settings.deleteOriginals;
+              emit("job-done", {
+                id: j.id, skipped: false, output: j.path, inputBytes: 2.6e9, outputBytes: 2.12e9, frames: 360, seconds: 9.1,
+                fps: 39.6, backend: "CPU", originalDeleted: !!del, originalTrashed: !!del && a.settings.deleteMode !== "permanent",
+              });
             }
             emit("queue-finished", null);
           })();

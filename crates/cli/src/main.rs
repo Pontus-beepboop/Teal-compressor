@@ -1185,6 +1185,70 @@ mod tests {
         assert!(saw_done && saw_finished, "SSE stream should emit job-done and queue-finished");
         assert!(media_dir.join("Out").join("WEB_0001.NEV").is_file());
 
+        // Delete Originals: a copy that does not match keeps the original, a good one deletes it.
+        let out_clip = media_dir.join("Out").join("WEB_0001.NEV");
+        let bogus = media_dir.join("Out").join("BOGUS.NEV");
+        std::fs::write(&bogus, b"not a clip").unwrap();
+        let del_body = serde_json::json!({ "items": [
+            { "id": 9, "path": web_clip.to_string_lossy(), "output": bogus.to_string_lossy() },
+        ] })
+        .to_string();
+        let (st, del_bytes) = http_req("POST", "/api/invoke/delete_originals", &del_body);
+        assert_eq!(st, 200);
+        let del_val: serde_json::Value = serde_json::from_slice(&del_bytes).unwrap();
+        assert_eq!(del_val[0]["ok"], serde_json::Value::Bool(false));
+        assert!(web_clip.is_file(), "original must be kept when its copy does not check out");
+        let del_body = serde_json::json!({ "items": [
+            { "id": 1, "path": web_clip.to_string_lossy(), "output": web_clip.to_string_lossy() },
+        ] })
+        .to_string();
+        let (_, del_bytes) = http_req("POST", "/api/invoke/delete_originals", &del_body);
+        let del_val: serde_json::Value = serde_json::from_slice(&del_bytes).unwrap();
+        assert_eq!(del_val[0]["ok"], serde_json::Value::Bool(false), "a clip is never its own copy");
+        assert!(web_clip.is_file());
+        let del_body = serde_json::json!({ "items": [
+            { "id": 1, "path": web_clip.to_string_lossy(), "output": out_clip.to_string_lossy() },
+        ] })
+        .to_string();
+        let (st, del_bytes) = http_req("POST", "/api/invoke/delete_originals", &del_body);
+        assert_eq!(st, 200);
+        let del_val: serde_json::Value = serde_json::from_slice(&del_bytes).unwrap();
+        assert_eq!(del_val[0]["ok"], serde_json::Value::Bool(true), "{del_val}");
+        assert!(!web_clip.exists(), "original should be deleted");
+        assert!(out_clip.is_file(), "compressed copy must stay");
+        let (_, q_bytes) = http_req("POST", "/api/invoke/get_queue", "{}");
+        let q_val: serde_json::Value = serde_json::from_slice(&q_bytes).unwrap();
+        assert_eq!(q_val["jobs"][0]["result"]["originalDeleted"], serde_json::Value::Bool(true));
+
+        // Delete after compressing: the run deletes the original once the copy checks out.
+        let auto_clip = media_dir.join("AUTO_0001.NEV");
+        make_synthetic_nev(&auto_clip, 128, 64, 2);
+        let start_body = serde_json::json!({
+            "jobs": [{ "id": 2, "path": auto_clip.to_string_lossy(), "quality": 2, "resolution": "original" }],
+            "settings": { "backend": "cpu", "outputFolder": media_dir.join("Out").to_string_lossy(), "deleteOriginals": true }
+        })
+        .to_string();
+        let (st, _) = http_req("POST", "/api/invoke/start", &start_body);
+        assert_eq!(st, 200);
+        let mut done_payload = serde_json::Value::Null;
+        line.clear();
+        while sse_reader.read_line(&mut line).unwrap_or(0) > 0 {
+            if let Some(json_str) = line.trim().strip_prefix("data: ") {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+                    if v["event"] == "job-done" {
+                        done_payload = v["payload"].clone();
+                    }
+                    if v["event"] == "queue-finished" {
+                        break;
+                    }
+                }
+            }
+            line.clear();
+        }
+        assert_eq!(done_payload["originalDeleted"], serde_json::Value::Bool(true), "{done_payload}");
+        assert!(!auto_clip.exists(), "original should be deleted after compressing");
+        assert!(media_dir.join("Out").join("AUTO_0001.NEV").is_file());
+
         let _ = std::fs::remove_dir_all(&base);
     }
 }

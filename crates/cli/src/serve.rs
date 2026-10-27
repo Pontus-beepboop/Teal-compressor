@@ -93,6 +93,10 @@ struct SetWatchSettingsArgs {
 struct Settings {
     backend: String,
     output_folder: Option<String>,
+    /// Delete each original once its compressed copy is written and checks out. The server
+    /// has no Trash, so this is permanent.
+    #[serde(default)]
+    delete_originals: bool,
 }
 
 #[derive(Deserialize, Clone)]
@@ -175,6 +179,30 @@ struct QueueSnapshot<'a> {
 #[derive(Deserialize)]
 struct SetPausedArgs {
     paused: bool,
+}
+
+#[derive(Deserialize)]
+struct DeleteOriginalsArgs {
+    items: Vec<DeleteItem>,
+}
+
+#[derive(Deserialize)]
+struct DeleteItem {
+    id: u64,
+    /// The original clip.
+    path: String,
+    /// Its compressed copy, checked before the original goes.
+    output: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteResult {
+    id: u64,
+    ok: bool,
+    trashed: bool,
+    bytes: u64,
+    error: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -280,6 +308,13 @@ struct JobDone {
     seconds: f64,
     fps: f64,
     backend: String,
+    /// The original was deleted after this clip ("Delete originals after compressing", or
+    /// later with Delete Originals).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    original_deleted: bool,
+    /// Why the original was kept although deleting was asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delete_error: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -658,6 +693,8 @@ fn start_queue(state: &Arc<ServerState>, args: StartArgs) -> Result<(), String> 
                         seconds: 0.0,
                         fps: 0.0,
                         backend: String::new(),
+                        original_deleted: false,
+                        delete_error: None,
                     }),
                 ),
                 None => ("waiting", 0.0, None, None),
@@ -727,6 +764,26 @@ fn start_queue(state: &Arc<ServerState>, args: StartArgs) -> Result<(), String> 
     Ok(())
 }
 
+/// Deletes `original` for good once `compressed` checks out as a complete copy of it. Only
+/// files under the browse root are touched.
+fn remove_original(st: &ServerState, original: &Path, compressed: &Path) -> Result<u64, String> {
+    if !within_root(original, &st.browse_root) {
+        return Err(format!("original kept: it is outside the browse root ({})", st.browse_root.display()));
+    }
+    bluecompress::delete_original(original, compressed).map_err(|e| format!("original kept: {e}"))
+}
+
+/// Deletes the original of a finished clip when the run asks for it, and records how.
+fn delete_original_if(st: &ServerState, original: &Path, settings: &Settings, mut done: JobDone) -> JobDone {
+    if settings.delete_originals {
+        match remove_original(st, original, Path::new(&done.output)) {
+            Ok(_) => done.original_deleted = true,
+            Err(e) => done.delete_error = Some(e),
+        }
+    }
+    done
+}
+
 fn run_job(st: &Arc<ServerState>, job: &QueueJob, settings: &Settings) {
     let backend = backend_of(&settings.backend, st.default_backend);
     let folder = settings.output_folder.as_deref();
@@ -752,7 +809,10 @@ fn run_job(st: &Arc<ServerState>, job: &QueueJob, settings: &Settings) {
                 seconds: 0.0,
                 fps: 0.0,
                 backend: String::new(),
+                original_deleted: false,
+                delete_error: None,
             };
+            let done = delete_original_if(st, &input, settings, done);
             update_job(st, job.id, |j| {
                 j.state = "done".into();
                 j.fraction = 1.0;
@@ -836,7 +896,10 @@ fn run_job(st: &Arc<ServerState>, job: &QueueJob, settings: &Settings) {
                 seconds: active_seconds(o.seconds, paused_for),
                 fps: active_fps(o.frames, o.seconds, o.fps, paused_for),
                 backend: o.backend,
+                original_deleted: false,
+                delete_error: None,
             };
+            let done = delete_original_if(st, &options.input, settings, done);
             update_job(st, job.id, |j| {
                 j.state = "done".into();
                 j.fraction = 1.0;
@@ -965,6 +1028,31 @@ fn invoke_command(state: &Arc<ServerState>, cmd: &str, body: &[u8]) -> HttpRespo
             let snap = queue_snapshot(state);
             broadcast_event(&state.sse_clients, "queue-changed", &snap);
             HttpResponse::json(200, &snap)
+        }
+        "delete_originals" => {
+            let args: DeleteOriginalsArgs = match serde_json::from_slice(body) {
+                Ok(a) => a,
+                Err(e) => return HttpResponse::text(400, &format!("invalid delete_originals args: {e}")),
+            };
+            let results: Vec<DeleteResult> = args
+                .items
+                .iter()
+                .map(|it| match remove_original(state, Path::new(&it.path), Path::new(&it.output)) {
+                    Ok(bytes) => DeleteResult { id: it.id, ok: true, trashed: false, bytes, error: None },
+                    Err(e) => DeleteResult { id: it.id, ok: false, trashed: false, bytes: 0, error: Some(e) },
+                })
+                .collect();
+            // Remember it on the server's queue, so a reloaded page shows the originals as gone.
+            {
+                let mut q = state.queue.lock().unwrap();
+                for r in results.iter().filter(|r| r.ok) {
+                    if let Some(res) = q.jobs.iter_mut().find(|j| j.id == r.id).and_then(|j| j.result.as_mut()) {
+                        res.original_deleted = true;
+                        res.delete_error = None;
+                    }
+                }
+            }
+            HttpResponse::json(200, &results)
         }
         "initial_paths" => {
             let paths: Vec<String> = std::mem::take(&mut *state.initial.lock().unwrap());

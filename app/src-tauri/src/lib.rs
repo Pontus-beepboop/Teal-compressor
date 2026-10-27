@@ -3,7 +3,8 @@
 //! progress with events.
 //!
 //! Commands: app_info, scan, plan_output, preview, thumbnail, check_existing, start, cancel,
-//! set_paused, is_running, pick_clips, pick_folder, reveal, initial_paths, confirm_quit.
+//! set_paused, is_running, delete_originals, pick_clips, pick_folder, reveal, initial_paths,
+//! confirm_quit.
 //! Events: job-start {id, output}, job-progress {id, fraction, fps},
 //! job-done {id, skipped, ...outcome}, job-error {id, error, cancelled}, queue-finished {},
 //! queue-paused {paused}, open-paths [paths], quit-requested {}.
@@ -59,6 +60,18 @@ struct AppInfo {
 struct Settings {
     backend: String,
     output_folder: Option<String>,
+    /// Delete each original once its compressed copy is written and checks out.
+    #[serde(default)]
+    delete_originals: bool,
+    /// "trash" (default) moves originals to the Trash / Recycle Bin; "permanent" removes them.
+    #[serde(default)]
+    delete_mode: Option<String>,
+}
+
+impl Settings {
+    fn permanent(&self) -> bool {
+        self.delete_mode.as_deref() == Some("permanent")
+    }
 }
 
 #[derive(Deserialize, Clone)]
@@ -103,6 +116,31 @@ struct JobDone {
     seconds: f64,
     fps: f64,
     backend: String,
+    /// The original was deleted after this clip (setting "Delete originals after compressing").
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    original_deleted: bool,
+    /// ...and it went to the Trash rather than being removed outright.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    original_trashed: bool,
+    /// Why the original was kept although deleting was asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delete_error: Option<String>,
+}
+
+impl JobDone {
+    /// Deletes the original of a finished clip when the run asks for it, and records how.
+    fn delete_original_if(mut self, input: &Path, settings: &Settings) -> Self {
+        if settings.delete_originals {
+            match remove_original(input, Path::new(&self.output), settings.permanent()) {
+                Ok(r) => {
+                    self.original_deleted = true;
+                    self.original_trashed = r.trashed;
+                }
+                Err(e) => self.delete_error = Some(e),
+            }
+        }
+        self
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -214,6 +252,68 @@ fn output_for(input: &Path, folder: Option<&str>, quality: u8, resolution: &str)
     let base = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let parent = dir.parent().unwrap_or(Path::new("."));
     (2..).map(|n| parent.join(format!("{base} ({n})")).join(name)).find(|p| free(p)).unwrap()
+}
+
+#[derive(Debug)]
+struct Removed {
+    bytes: u64,
+    trashed: bool,
+}
+
+/// Deletes `original` once `compressed` checks out as a complete copy of it (opens, same
+/// codec, frames and audio tracks): to the Trash / Recycle Bin, or for good with `permanent`.
+/// If the Trash cannot take it (some network volumes have none) the original is kept and the
+/// error says so; it is never deleted permanently unless that was asked for.
+fn remove_original(original: &Path, compressed: &Path, permanent: bool) -> Result<Removed, String> {
+    let info = engine::verify_compressed(original, compressed).map_err(|e| format!("original kept: {e}"))?;
+    if permanent {
+        std::fs::remove_file(original).map_err(|e| format!("cannot delete the original: {e}"))?;
+        Ok(Removed { bytes: info.file_bytes, trashed: false })
+    } else {
+        trash::delete(original).map_err(|e| {
+            format!("cannot move the original to the Trash ({e}); it was kept. Choose Delete Permanently to remove it")
+        })?;
+        Ok(Removed { bytes: info.file_bytes, trashed: true })
+    }
+}
+
+#[derive(Deserialize)]
+struct DeleteItem {
+    id: u64,
+    /// The original clip.
+    path: String,
+    /// Its compressed copy, checked before the original goes.
+    output: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteResult {
+    id: u64,
+    ok: bool,
+    trashed: bool,
+    bytes: u64,
+    error: Option<String>,
+}
+
+/// Deletes the originals of finished clips ("Delete Originals"), each only after its
+/// compressed copy checks out. Not while a queue runs.
+#[tauri::command(async)]
+fn delete_originals(
+    state: State<'_, Runner>,
+    items: Vec<DeleteItem>,
+    permanent: bool,
+) -> Result<Vec<DeleteResult>, String> {
+    if state.running.load(Ordering::SeqCst) {
+        return Err("wait for the queue to finish".into());
+    }
+    Ok(items
+        .into_iter()
+        .map(|it| match remove_original(Path::new(&it.path), Path::new(&it.output), permanent) {
+            Ok(r) => DeleteResult { id: it.id, ok: true, trashed: r.trashed, bytes: r.bytes, error: None },
+            Err(e) => DeleteResult { id: it.id, ok: false, trashed: false, bytes: 0, error: Some(e) },
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -410,7 +510,11 @@ fn start(app: AppHandle, state: State<'_, Runner>, jobs: Vec<JobRequest>, settin
                             seconds: 0.0,
                             fps: 0.0,
                             backend: String::new(),
-                        },
+                            original_deleted: false,
+                            original_trashed: false,
+                            delete_error: None,
+                        }
+                        .delete_original_if(&input, &settings),
                     );
                     continue;
                 }
@@ -431,6 +535,7 @@ fn start(app: AppHandle, state: State<'_, Runner>, jobs: Vec<JobRequest>, settin
             }
             let out_s = output.to_string_lossy().into_owned();
             let _ = app.emit("job-start", JobStart { id: job.id, output: out_s.clone() });
+            let job_input = input.clone();
             let options = Options {
                 input,
                 output,
@@ -475,7 +580,11 @@ fn start(app: AppHandle, state: State<'_, Runner>, jobs: Vec<JobRequest>, settin
                             seconds: active_seconds(o.seconds, paused_for),
                             fps: active_fps(o.frames, o.seconds, o.fps, paused_for),
                             backend: o.backend,
-                        },
+                            original_deleted: false,
+                            original_trashed: false,
+                            delete_error: None,
+                        }
+                        .delete_original_if(&job_input, &settings),
                     );
                 }
                 Err(e) => {
@@ -577,6 +686,7 @@ pub fn run() {
             set_paused,
             check_existing,
             is_running,
+            delete_originals,
             pick_clips,
             pick_folder,
             reveal,
